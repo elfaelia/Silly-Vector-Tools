@@ -61,3 +61,48 @@
     opacity: 0.65;
     line-height: 1.35;
 }
+
+.lvt-panel .lvt-log {
+    max-height: 240px;
+    overflow-y: auto;
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 6px;
+    padding: 6px;
+    font-size: 0.85em;
+}
+
+.lvt-panel .lvt-log-empty {
+    opacity: 0.55;
+    padding: 4px 2px;
+}
+
+.lvt-panel .lvt-log-head {
+    font-weight: bold;
+    opacity: 0.8;
+    padding-bottom: 4px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+}
+
+.lvt-panel .lvt-log-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 0;
+}
+
+.lvt-panel .lvt-log-badge {
+    flex: 0 0 auto;
+}
+
+.lvt-panel .lvt-log-name {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.lvt-panel .lvt-log-world {
+    flex: 0 0 auto;
+    opacity: 0.5;
+    font-size: 0.85em;
+}

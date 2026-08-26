@@ -1,4 +1,4 @@
-import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
+import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import {
     world_names,
@@ -396,6 +396,116 @@ async function purgeCollection(collectionId) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Activation log
+//
+// Two events fire per generation:
+//   WORLDINFO_FORCE_ACTIVATE — emitted by the vectors extension, semantic hits only
+//   WORLD_INFO_ACTIVATED     — emitted by world-info.js, everything that fired
+// Force-activate always lands first, so we stash it and diff against the full
+// set to work out which entries came from keywords instead.
+// ---------------------------------------------------------------------------
+
+/** @type {{world: string, uid: number, comment: string, source: string}[]} */
+let lastActivation = [];
+/** @type {Set<string>} */
+let pendingVectorKeys = new Set();
+let lastActivationAt = null;
+
+/**
+ * @param {object} entry
+ * @returns {string}
+ */
+function entryKey(entry) {
+    return `${entry.world}.${entry.uid}`;
+}
+
+/**
+ * @param {object} entry
+ * @returns {string}
+ */
+function entryLabel(entry) {
+    if (entry.comment) {
+        return entry.comment;
+    }
+
+    if (Array.isArray(entry.key) && entry.key.length > 0) {
+        return entry.key.join(', ');
+    }
+
+    const content = String(entry.content ?? '').replace(/\s+/g, ' ').trim();
+    return content.length > 60 ? `${content.slice(0, 60)}...` : (content || `uid ${entry.uid}`);
+}
+
+function initActivationTracking() {
+    eventSource.on(event_types.WORLDINFO_FORCE_ACTIVATE, (entries) => {
+        if (!Array.isArray(entries)) {
+            return;
+        }
+        for (const entry of entries) {
+            pendingVectorKeys.add(entryKey(entry));
+        }
+    });
+
+    eventSource.on(event_types.WORLD_INFO_ACTIVATED, (entries) => {
+        if (!Array.isArray(entries)) {
+            return;
+        }
+
+        lastActivation = entries.map(entry => ({
+            world: entry.world ?? '(unknown)',
+            uid: entry.uid,
+            comment: entryLabel(entry),
+            source: entry.constant === true
+                ? 'constant'
+                : pendingVectorKeys.has(entryKey(entry))
+                    ? 'vector'
+                    : 'keyword',
+        }));
+
+        lastActivationAt = new Date();
+        pendingVectorKeys = new Set();
+        renderActivationLog();
+    });
+}
+
+function renderActivationLog() {
+    const container = $('#lvt_activation_log');
+
+    if (container.length === 0) {
+        return;
+    }
+
+    container.empty();
+
+    if (lastActivation.length === 0) {
+        container.append('<div class="lvt-log-empty">Nothing yet — send a message.</div>');
+        return;
+    }
+
+    const vectorCount = lastActivation.filter(x => x.source === 'vector').length;
+    const time = lastActivationAt ? lastActivationAt.toLocaleTimeString() : '';
+
+    container.append(
+        $('<div class="lvt-log-head"></div>').text(
+            `${lastActivation.length} entries — ${vectorCount} by vector — ${time}`,
+        ),
+    );
+
+    // Vector hits first: they're the ones worth eyeballing when tuning threshold.
+    const order = { vector: 0, keyword: 1, constant: 2 };
+    const sorted = [...lastActivation].sort((a, b) => order[a.source] - order[b.source]);
+
+    for (const item of sorted) {
+        const badge = item.source === 'vector' ? '🔗' : item.source === 'constant' ? '🔵' : '🟢';
+        const row = $('<div class="lvt-log-row"></div>');
+        row.append($('<span class="lvt-log-badge"></span>').text(badge));
+        row.append($('<span class="lvt-log-name"></span>').text(item.comment));
+        row.append($('<span class="lvt-log-world"></span>').text(item.world));
+        container.append(row);
+    }
+}
+
 /** @returns {string} Currently selected lorebook name in the extension dropdown. */
 function getSelectedBook() {
     return String($('#lvt_book_select').val() ?? '');
@@ -732,6 +842,9 @@ function addSettingsPanel() {
                 </div>
                 <input id="lvt_bank_file" type="file" accept="application/json,.json" hidden>
 
+                <div class="lvt-section-label">Last activation</div>
+                <div id="lvt_activation_log" class="lvt-log"></div>
+
                 <div id="lvt_status" class="lvt-status"></div>
                 <small class="lvt-note">
                     Entries only activate by similarity if they're marked vectorized.
@@ -981,5 +1094,7 @@ function registerCommands() {
 jQuery(async () => {
     addSettingsPanel();
     registerCommands();
+    initActivationTracking();
+    renderActivationLog();
     console.log(`${MODULE}: loaded`);
 });
