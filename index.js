@@ -1,4 +1,4 @@
-import { getRequestHeaders } from '../../../../script.js';
+import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import {
     world_names,
@@ -18,9 +18,220 @@ import { textgen_types, textgenerationwebui_settings } from '../../../textgen-se
 import { oai_settings } from '../../../openai.js';
 
 const MODULE = 'lorebook-vector-tools';
+const SETTINGS_KEY = 'lorebookVectorTools';
+const MAX_BANKS_PER_BOOK = 10;
 
 /** Sources that compute embeddings in the browser. Not supported here. */
 const CLIENT_SIDE_SOURCES = ['webllm', 'koboldcpp'];
+
+// ---------------------------------------------------------------------------
+// Keyword banks
+//
+// A bank is a snapshot of every entry's keywords in one lorebook, stored in
+// extension settings so it survives reloads. Entries are matched back by uid
+// first, falling back to a content hash so a re-imported book still restores.
+// ---------------------------------------------------------------------------
+
+/** @returns {{banks: Record<string, object[]>, autoBank: boolean}} */
+function getSettings() {
+    if (!extension_settings[SETTINGS_KEY]) {
+        extension_settings[SETTINGS_KEY] = { banks: {}, autoBank: true };
+    }
+
+    const settings = extension_settings[SETTINGS_KEY];
+
+    if (!settings.banks || typeof settings.banks !== 'object') {
+        settings.banks = {};
+    }
+
+    if (typeof settings.autoBank !== 'boolean') {
+        settings.autoBank = true;
+    }
+
+    return settings;
+}
+
+/**
+ * @param {string} bookName
+ * @returns {object[]} Snapshots, newest first.
+ */
+function getBanks(bookName) {
+    const settings = getSettings();
+    return Array.isArray(settings.banks[bookName]) ? settings.banks[bookName] : [];
+}
+
+/**
+ * Snapshots current keywords for a lorebook.
+ * @param {string} bookName
+ * @param {string} [label]
+ * @returns {Promise<{id: string, count: number}>}
+ */
+async function saveBank(bookName, label) {
+    const data = await loadWorldInfo(bookName);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${bookName}"`);
+    }
+
+    const entries = {};
+    let count = 0;
+
+    for (const entry of Object.values(data.entries)) {
+        const primary = Array.isArray(entry.key) ? entry.key : [];
+        const secondary = Array.isArray(entry.keysecondary) ? entry.keysecondary : [];
+
+        if (primary.length === 0 && secondary.length === 0) {
+            continue;
+        }
+
+        entries[String(entry.uid)] = {
+            key: [...primary],
+            keysecondary: [...secondary],
+            contentHash: entry.content ? getStringHash(entry.content) : null,
+            comment: entry.comment ?? '',
+        };
+        count++;
+    }
+
+    if (count === 0) {
+        throw new Error(`No keywords to bank in "${bookName}".`);
+    }
+
+    const snapshot = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        label: label || new Date().toLocaleString(),
+        savedAt: new Date().toISOString(),
+        entryCount: count,
+        entries,
+    };
+
+    const settings = getSettings();
+    const list = getBanks(bookName);
+    list.unshift(snapshot);
+    settings.banks[bookName] = list.slice(0, MAX_BANKS_PER_BOOK);
+    saveSettingsDebounced();
+
+    return { id: snapshot.id, count };
+}
+
+/**
+ * Restores a snapshot's keywords back onto the lorebook.
+ * @param {string} bookName
+ * @param {string} bankId
+ * @returns {Promise<{restored: number, missing: number}>}
+ */
+async function restoreBank(bookName, bankId) {
+    const snapshot = getBanks(bookName).find(x => x.id === bankId);
+
+    if (!snapshot) {
+        throw new Error('That saved keyword set no longer exists.');
+    }
+
+    const data = await loadWorldInfo(bookName);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${bookName}"`);
+    }
+
+    const liveEntries = Object.values(data.entries);
+    const byHash = new Map();
+
+    for (const entry of liveEntries) {
+        if (entry.content) {
+            byHash.set(getStringHash(entry.content), entry);
+        }
+    }
+
+    let restored = 0;
+    let missing = 0;
+
+    for (const [uid, saved] of Object.entries(snapshot.entries)) {
+        let target = data.entries[uid];
+
+        // uid changed (re-import, dedupe, manual edit) — fall back to content.
+        if (!target && saved.contentHash !== null) {
+            target = byHash.get(saved.contentHash);
+        }
+
+        if (!target) {
+            missing++;
+            continue;
+        }
+
+        target.key = [...saved.key];
+        target.keysecondary = [...saved.keysecondary];
+        setWIOriginalDataValue(data, target.uid, originalWIDataKeyMap.key, [...saved.key]);
+        setWIOriginalDataValue(data, target.uid, originalWIDataKeyMap.keysecondary, [...saved.keysecondary]);
+        restored++;
+    }
+
+    if (restored > 0) {
+        await saveWorldInfo(bookName, data, true);
+        reloadEditor(bookName);
+    }
+
+    return { restored, missing };
+}
+
+/**
+ * @param {string} bookName
+ * @param {string} bankId
+ */
+function deleteBank(bookName, bankId) {
+    const settings = getSettings();
+    settings.banks[bookName] = getBanks(bookName).filter(x => x.id !== bankId);
+    saveSettingsDebounced();
+}
+
+/**
+ * Downloads a snapshot as JSON, so it survives a settings wipe or moves machines.
+ * @param {string} bookName
+ * @param {string} bankId
+ */
+function exportBank(bookName, bankId) {
+    const snapshot = getBanks(bookName).find(x => x.id === bankId);
+
+    if (!snapshot) {
+        throw new Error('That saved keyword set no longer exists.');
+    }
+
+    const payload = { format: 'lvt-keyword-bank', version: 1, book: bookName, snapshot };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const safeName = bookName.replace(/[^\w\-]+/g, '_');
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${safeName}-keywords-${snapshot.id}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+}
+
+/**
+ * @param {string} bookName
+ * @param {File} file
+ */
+async function importBank(bookName, file) {
+    const text = await file.text();
+    const payload = JSON.parse(text);
+
+    if (payload?.format !== 'lvt-keyword-bank' || !payload?.snapshot?.entries) {
+        throw new Error('That file is not a keyword bank export.');
+    }
+
+    const snapshot = payload.snapshot;
+    snapshot.id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    snapshot.label = `${snapshot.label ?? 'imported'} (imported)`;
+
+    const settings = getSettings();
+    const list = getBanks(bookName);
+    list.unshift(snapshot);
+    settings.banks[bookName] = list.slice(0, MAX_BANKS_PER_BOOK);
+    saveSettingsDebounced();
+
+    return snapshot.entryCount ?? Object.keys(snapshot.entries).length;
+}
 
 /**
  * Mirrors the Vector Storage extension's request body construction.
@@ -253,6 +464,16 @@ async function unmarkBookVectorized(name) {
  * @param {boolean} includeSecondary
  */
 async function clearBookKeywords(name, includeSecondary) {
+    // Snapshot first, so a mistaken clear is always recoverable.
+    if (getSettings().autoBank) {
+        try {
+            await saveBank(name, `auto-backup before clear`);
+        } catch (error) {
+            // Nothing to bank (no keywords) is fine; anything else is worth knowing.
+            console.debug(`${MODULE}: auto-bank skipped —`, error.message);
+        }
+    }
+
     const data = await loadWorldInfo(name);
 
     if (!data || !data.entries) {
@@ -374,6 +595,33 @@ function refreshBookList() {
     }
 }
 
+function refreshBankList() {
+    const select = $('#lvt_bank_select');
+    const previous = String(select.val() ?? '');
+    const book = getSelectedBook();
+    select.empty();
+
+    const banks = book ? getBanks(book) : [];
+
+    if (banks.length === 0) {
+        select.append('<option value="">-- no saved keyword sets --</option>');
+        return;
+    }
+
+    for (const bank of banks) {
+        const count = bank.entryCount ?? Object.keys(bank.entries ?? {}).length;
+        select.append(
+            $('<option></option>')
+                .val(bank.id)
+                .text(`${bank.label} — ${count} entries`),
+        );
+    }
+
+    if (previous && banks.some(x => x.id === previous)) {
+        select.val(previous);
+    }
+}
+
 function setBusy(busy) {
     $('#lvt_panel button').prop('disabled', busy);
     $('#lvt_status').toggleClass('lvt_busy', busy);
@@ -452,9 +700,26 @@ function addSettingsPanel() {
                     <input id="lvt_include_secondary" type="checkbox" checked>
                     <span>Also clear secondary keywords</span>
                 </label>
+                <label class="checkbox_label" for="lvt_auto_bank">
+                    <input id="lvt_auto_bank" type="checkbox" checked>
+                    <span>Auto-save keywords before clearing</span>
+                </label>
                 <div class="lvt-buttons">
                     <button id="lvt_clear_keys" class="menu_button lvt-danger">Clear all keywords in this lorebook</button>
                 </div>
+
+                <div class="lvt-section-label">Saved keyword sets</div>
+                <div class="lvt-row">
+                    <select id="lvt_bank_select" class="text_pole flex1"></select>
+                </div>
+                <div class="lvt-buttons">
+                    <button id="lvt_bank_save" class="menu_button">Save current keywords</button>
+                    <button id="lvt_bank_restore" class="menu_button">Restore selected set</button>
+                    <button id="lvt_bank_export" class="menu_button">Export selected to file</button>
+                    <button id="lvt_bank_import" class="menu_button">Import from file</button>
+                    <button id="lvt_bank_delete" class="menu_button lvt-danger">Delete selected set</button>
+                </div>
+                <input id="lvt_bank_file" type="file" accept="application/json,.json" hidden>
 
                 <div id="lvt_status" class="lvt-status"></div>
                 <small class="lvt-note">
@@ -509,15 +774,102 @@ function addSettingsPanel() {
 
     $('#lvt_clear_keys').on('click', () => runAction({
         confirmHeader: 'Clear all keywords?',
-        confirmText: 'This empties the keyword fields for every entry in this lorebook and cannot be undone. Export a backup first if you are unsure.',
+        confirmText: 'This empties the keyword fields for every entry in this lorebook. With auto-save on, a restorable copy is banked first.',
         run: async (book) => {
             const includeSecondary = $('#lvt_include_secondary').prop('checked');
             const n = await clearBookKeywords(book, includeSecondary);
+            refreshBankList();
             return `Cleared keywords on ${n} entr${n === 1 ? 'y' : 'ies'} in "${book}".`;
         },
     }));
 
+    $('#lvt_auto_bank')
+        .prop('checked', getSettings().autoBank)
+        .on('input', function () {
+            getSettings().autoBank = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+
+    $('#lvt_book_select').on('change', () => {
+        refreshBankList();
+        setStatus('');
+    });
+
+    $('#lvt_bank_save').on('click', () => runAction({
+        run: async (book) => {
+            const label = await Popup.show.input('Name this keyword set', 'Optional — leave blank for a timestamp.', '');
+            if (label === null) {
+                throw new Error('Cancelled.');
+            }
+            const { count } = await saveBank(book, label);
+            refreshBankList();
+            return `Banked keywords from ${count} entr${count === 1 ? 'y' : 'ies'} in "${book}".`;
+        },
+    }));
+
+    $('#lvt_bank_restore').on('click', () => runAction({
+        confirmHeader: 'Restore keywords?',
+        confirmText: 'Overwrites the current keywords on any entry present in the saved set.',
+        run: async (book) => {
+            const bankId = String($('#lvt_bank_select').val() ?? '');
+            if (!bankId) {
+                throw new Error('No saved set selected.');
+            }
+            const { restored, missing } = await restoreBank(book, bankId);
+            const tail = missing > 0 ? ` ${missing} saved entr${missing === 1 ? 'y' : 'ies'} no longer exist.` : '';
+            return `Restored keywords to ${restored} entr${restored === 1 ? 'y' : 'ies'}.${tail}`;
+        },
+    }));
+
+    $('#lvt_bank_export').on('click', () => runAction({
+        run: async (book) => {
+            const bankId = String($('#lvt_bank_select').val() ?? '');
+            if (!bankId) {
+                throw new Error('No saved set selected.');
+            }
+            exportBank(book, bankId);
+            return 'Exported.';
+        },
+    }));
+
+    $('#lvt_bank_import').on('click', () => {
+        if (!getSelectedBook()) {
+            setStatus('Pick a lorebook first.', 'error');
+            return;
+        }
+        $('#lvt_bank_file').val('').trigger('click');
+    });
+
+    $('#lvt_bank_file').on('change', function () {
+        const file = this.files?.[0];
+        if (!file) {
+            return;
+        }
+        runAction({
+            run: async (book) => {
+                const count = await importBank(book, file);
+                refreshBankList();
+                return `Imported a set of ${count} entr${count === 1 ? 'y' : 'ies'}. Restore it to apply.`;
+            },
+        });
+    });
+
+    $('#lvt_bank_delete').on('click', () => runAction({
+        confirmHeader: 'Delete saved set?',
+        confirmText: 'This removes the snapshot. Your lorebook is not changed.',
+        run: async (book) => {
+            const bankId = String($('#lvt_bank_select').val() ?? '');
+            if (!bankId) {
+                throw new Error('No saved set selected.');
+            }
+            deleteBank(book, bankId);
+            refreshBankList();
+            return 'Deleted.';
+        },
+    }));
+
     refreshBookList();
+    refreshBankList();
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +925,34 @@ function registerCommands() {
         callback: async (_args, value) => {
             const { inserted } = await vectorizeBook(String(value));
             return String(inserted);
+        },
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lvt-bank',
+        helpString: 'Saves a snapshot of the named lorebook\'s keywords.',
+        returns: 'number of entries banked',
+        unnamedArgumentList: [bookArgument()],
+        callback: async (_args, value) => {
+            const { count } = await saveBank(String(value));
+            refreshBankList();
+            return String(count);
+        },
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lvt-restore',
+        helpString: 'Restores the most recent saved keyword set for the named lorebook.',
+        returns: 'number of entries restored',
+        unnamedArgumentList: [bookArgument()],
+        callback: async (_args, value) => {
+            const book = String(value);
+            const latest = getBanks(book)[0];
+            if (!latest) {
+                throw new Error(`No saved keyword sets for "${book}".`);
+            }
+            const { restored } = await restoreBank(book, latest.id);
+            return String(restored);
         },
     }));
 
