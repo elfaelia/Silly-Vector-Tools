@@ -1,0 +1,13 @@
+{
+    "display_name": "Lorebook Vector Tools",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "elfaelia",
+    "version": "1.0.0",
+    "homePage": "https://github.com/elfaelia/lorebook-vector-tools",
+    "minimum_client_version": "1.18.0"
+}

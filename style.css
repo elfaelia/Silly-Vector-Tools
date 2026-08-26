@@ -1,0 +1,63 @@
+.lvt-panel .lvt-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 8px;
+}
+
+.lvt-panel .lvt-row .flex1 {
+    flex: 1;
+    min-width: 0;
+}
+
+.lvt-panel .lvt-section-label {
+    font-weight: bold;
+    opacity: 0.8;
+    margin: 10px 0 4px;
+    font-size: 0.9em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.lvt-panel .lvt-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-bottom: 6px;
+}
+
+/* Full-width stacked buttons are far easier to hit on a phone
+   than the usual inline row. */
+.lvt-panel .lvt-buttons button {
+    width: 100%;
+    min-height: 36px;
+}
+
+.lvt-panel .lvt-danger {
+    border-color: var(--crimson70a, #b3404a);
+}
+
+.lvt-panel .lvt-status {
+    min-height: 1.2em;
+    margin: 6px 0;
+    font-size: 0.9em;
+    word-break: break-word;
+}
+
+.lvt-panel .lvt-status.lvt_ok {
+    color: var(--greenpalegold, #7bc47b);
+}
+
+.lvt-panel .lvt-status.lvt_err {
+    color: var(--crimson70a, #d9737f);
+}
+
+.lvt-panel .lvt-status.lvt_busy {
+    opacity: 0.6;
+}
+
+.lvt-panel .lvt-note {
+    display: block;
+    opacity: 0.65;
+    line-height: 1.35;
+}
