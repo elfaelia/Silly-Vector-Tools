@@ -411,6 +411,7 @@ let lastActivation = [];
 /** @type {Set<string>} */
 let pendingVectorKeys = new Set();
 let lastActivationAt = null;
+let sawActivationThisGeneration = false;
 
 /**
  * @param {object} entry
@@ -451,8 +452,51 @@ function truncate(text, max) {
     return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
 }
 
+/** @type {string[]} Rolling log of raw events, newest last. */
+let eventTrace = [];
+
+/**
+ * @param {string} line
+ */
+function trace(line) {
+    const stamp = new Date().toLocaleTimeString();
+    eventTrace.push(`${stamp} ${line}`);
+    eventTrace = eventTrace.slice(-25);
+    renderTrace();
+}
+
+function renderTrace() {
+    const container = $('#lvt_trace');
+
+    if (container.length === 0) {
+        return;
+    }
+
+    container.empty();
+
+    if (eventTrace.length === 0) {
+        container.append('<div class="lvt-log-empty">No events yet.</div>');
+        return;
+    }
+
+    for (const line of [...eventTrace].reverse()) {
+        container.append($('<div class="lvt-trace-row"></div>').text(line));
+    }
+}
+
 function initActivationTracking() {
+    // WORLD_INFO_ACTIVATED is guarded by `size > 0` upstream, so a generation
+    // where nothing fires emits nothing. Without an explicit per-generation
+    // reset, stale vector keys survive and mislabel the next turn's keyword
+    // hits as 🔗, and the panel keeps showing the previous turn's results.
+    eventSource.on(event_types.GENERATION_STARTED, () => {
+        pendingVectorKeys = new Set();
+        sawActivationThisGeneration = false;
+        trace('GENERATION_STARTED');
+    });
+
     eventSource.on(event_types.WORLDINFO_FORCE_ACTIVATE, (entries) => {
+        trace(`FORCE_ACTIVATE: ${Array.isArray(entries) ? entries.length : 'not-an-array'}`);
         if (!Array.isArray(entries)) {
             return;
         }
@@ -462,9 +506,12 @@ function initActivationTracking() {
     });
 
     eventSource.on(event_types.WORLD_INFO_ACTIVATED, (entries) => {
+        trace(`WI_ACTIVATED: ${Array.isArray(entries) ? entries.length : 'not-an-array'}`);
         if (!Array.isArray(entries)) {
             return;
         }
+
+        sawActivationThisGeneration = true;
 
         lastActivation = entries.map(entry => ({
             world: entry.world ?? '(unknown)',
@@ -479,9 +526,21 @@ function initActivationTracking() {
         }));
 
         lastActivationAt = new Date();
-        pendingVectorKeys = new Set();
         renderActivationLog();
     });
+
+    for (const endEvent of [event_types.GENERATION_ENDED, event_types.GENERATION_STOPPED]) {
+        eventSource.on(endEvent, () => {
+            trace(`${endEvent} (activated: ${sawActivationThisGeneration})`);
+            if (sawActivationThisGeneration) {
+                return;
+            }
+            // Nothing activated this turn — say so rather than leaving stale rows up.
+            lastActivation = [];
+            lastActivationAt = new Date();
+            renderActivationLog();
+        });
+    }
 }
 
 /**
@@ -884,6 +943,12 @@ function addSettingsPanel() {
                 <div class="lvt-section-label">Last activation</div>
                 <div id="lvt_activation_log" class="lvt-log"></div>
 
+                <div class="lvt-section-label">Event trace</div>
+                <div id="lvt_trace" class="lvt-log lvt-trace"></div>
+                <div class="lvt-buttons">
+                    <button id="lvt_trace_copy" class="menu_button">Copy trace</button>
+                </div>
+
                 <div id="lvt_status" class="lvt-status"></div>
                 <small class="lvt-note">
                     Entries only activate by similarity if they're marked vectorized.
@@ -898,6 +963,16 @@ function addSettingsPanel() {
     $('#lvt_refresh').on('click', () => {
         refreshBookList();
         setStatus('List refreshed.');
+    });
+
+    $('#lvt_trace_copy').on('click', async () => {
+        try {
+            await navigator.clipboard.writeText(eventTrace.join('\n'));
+            setStatus('Trace copied.', 'success');
+        } catch {
+            // Clipboard API needs a secure context; plain http over LAN won't have it.
+            setStatus('Copy failed — select the text manually.', 'error');
+        }
     });
 
     $('#lvt_stats').on('click', () => runAction({
@@ -1143,5 +1218,6 @@ jQuery(async () => {
     registerCommands();
     initActivationTracking();
     renderActivationLog();
+    renderTrace();
     console.log(`${MODULE}: loaded`);
 });

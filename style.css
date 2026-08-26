@@ -110,3 +110,17 @@
     opacity: 0.5;
     font-size: 0.85em;
 }
+
+.lvt-panel .lvt-trace {
+    max-height: 160px;
+    font-family: monospace;
+    font-size: 0.75em;
+}
+
+.lvt-panel .lvt-trace-row {
+    padding: 1px 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.8;
+}
