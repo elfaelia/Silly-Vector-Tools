@@ -574,6 +574,16 @@ function renderActivationLog() {
         row.append($('<span class="lvt-log-badge"></span>').text(badgeFor(item.source)));
         row.append($('<span class="lvt-log-name"></span>').text(item.comment));
         row.append($('<span class="lvt-log-world"></span>').text(item.world));
+
+        // No hover on touch, so tapping a row swaps the truncated label for the
+        // full text and wraps it.
+        const short = item.comment;
+        const long = item.full || item.comment;
+        row.on('click', function () {
+            const expanded = $(this).toggleClass('lvt-expanded').hasClass('lvt-expanded');
+            $(this).find('.lvt-log-name').text(expanded ? long : short);
+        });
+
         container.append(row);
     }
 }
@@ -601,6 +611,44 @@ function sortedActivation() {
  */
 function badgeFor(source) {
     return source === 'vector' ? '🔗' : source === 'constant' ? '🔵' : '🟢';
+}
+
+/**
+ * Reads a lorebook straight from the server, bypassing worldInfoCache.
+ * Used to verify writes actually landed — the cache would happily report our
+ * own in-memory change even if something overwrote the file afterwards.
+ * @param {string} name
+ */
+async function fetchWorldInfoFromServer(name) {
+    const response = await fetch('/api/worldinfo/get', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ name }),
+        cache: 'no-cache',
+    });
+
+    if (!response.ok) {
+        throw new Error(`Could not re-read "${name}" from the server (HTTP ${response.status})`);
+    }
+
+    return await response.json();
+}
+
+/**
+ * @param {string} name
+ * @returns {Promise<number>} Entries still holding keywords on disk.
+ */
+async function countRemainingKeywords(name) {
+    const data = await fetchWorldInfoFromServer(name);
+
+    if (!data || !data.entries) {
+        return -1;
+    }
+
+    return Object.values(data.entries).filter(entry =>
+        (Array.isArray(entry.key) && entry.key.length > 0) ||
+        (Array.isArray(entry.keysecondary) && entry.keysecondary.length > 0),
+    ).length;
 }
 
 /** @returns {string} Currently selected lorebook name in the extension dropdown. */
@@ -979,7 +1027,8 @@ function addSettingsPanel() {
         run: async (book) => {
             const s = await getBookStats(book);
             const embedded = s.embedded < 0 ? 'unknown' : String(s.embedded);
-            return `${s.total} entries · ${s.vectorized} vectorized · ${s.constant} constant · ${s.disabled} disabled · ${embedded} embedded`;
+            const withKeys = await countRemainingKeywords(book);
+            return `${s.total} entries · ${s.vectorized} vectorized · ${s.constant} constant · ${s.disabled} disabled · ${embedded} embedded · ${withKeys} with keywords`;
         },
     }));
 
@@ -1025,7 +1074,14 @@ function addSettingsPanel() {
             const includeSecondary = $('#lvt_include_secondary').prop('checked');
             const n = await clearBookKeywords(book, includeSecondary);
             refreshBankList();
-            return `Cleared keywords on ${n} entr${n === 1 ? 'y' : 'ies'} in "${book}".`;
+
+            const remaining = await countRemainingKeywords(book);
+
+            if (remaining > 0) {
+                throw new Error(`Cleared ${n} in memory, but ${remaining} entries still have keywords on disk. Close the World Info editor for "${book}" and try again — an open editor can write stale data back.`);
+            }
+
+            return `Cleared keywords on ${n} entr${n === 1 ? 'y' : 'ies'} in "${book}". Verified: 0 remaining on disk.`;
         },
     }));
 

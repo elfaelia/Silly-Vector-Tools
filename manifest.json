@@ -7,7 +7,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "elfaelia",
-    "version": "1.7.0",
+    "version": "1.9.0",
     "homePage": "https://github.com/elfaelia/lorebook-vector-tools",
     "minimum_client_version": "1.18.0"
 }
