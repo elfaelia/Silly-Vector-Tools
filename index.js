@@ -48,6 +48,14 @@ function getSettings() {
         settings.autoBank = true;
     }
 
+    if (typeof settings.showBar !== 'boolean') {
+        settings.showBar = true;
+    }
+
+    if (typeof settings.barCollapsed !== 'boolean') {
+        settings.barCollapsed = false;
+    }
+
     return settings;
 }
 
@@ -470,6 +478,14 @@ function initActivationTracking() {
 }
 
 function renderActivationLog() {
+    renderPanelLog();
+    renderActivationBar();
+}
+
+/**
+ * Detailed list inside the extension settings panel.
+ */
+function renderPanelLog() {
     const container = $('#lvt_activation_log');
 
     if (container.length === 0) {
@@ -483,27 +499,116 @@ function renderActivationLog() {
         return;
     }
 
-    const vectorCount = lastActivation.filter(x => x.source === 'vector').length;
+    const counts = countBySource();
     const time = lastActivationAt ? lastActivationAt.toLocaleTimeString() : '';
 
     container.append(
         $('<div class="lvt-log-head"></div>').text(
-            `${lastActivation.length} entries — ${vectorCount} by vector — ${time}`,
+            `${lastActivation.length} fired · ${counts.vector} vector · ${counts.keyword} keyword · ${counts.constant} constant · ${time}`,
         ),
     );
 
-    // Vector hits first: they're the ones worth eyeballing when tuning threshold.
-    const order = { vector: 0, keyword: 1, constant: 2 };
-    const sorted = [...lastActivation].sort((a, b) => order[a.source] - order[b.source]);
-
-    for (const item of sorted) {
-        const badge = item.source === 'vector' ? '🔗' : item.source === 'constant' ? '🔵' : '🟢';
+    for (const item of sortedActivation()) {
         const row = $('<div class="lvt-log-row"></div>');
-        row.append($('<span class="lvt-log-badge"></span>').text(badge));
+        row.append($('<span class="lvt-log-badge"></span>').text(badgeFor(item.source)));
         row.append($('<span class="lvt-log-name"></span>').text(item.comment));
         row.append($('<span class="lvt-log-world"></span>').text(item.world));
         container.append(row);
     }
+}
+
+/**
+ * Compact strip pinned above the chat, so you can see what fired without
+ * opening the extensions drawer.
+ */
+function renderActivationBar() {
+    const bar = $('#lvt_bar');
+
+    if (bar.length === 0) {
+        return;
+    }
+
+    bar.toggle(!!getSettings().showBar);
+
+    const summary = $('#lvt_bar_summary');
+    const chips = $('#lvt_bar_chips');
+    chips.empty();
+
+    if (lastActivation.length === 0) {
+        summary.text('No lorebook entries fired');
+        chips.append('<span class="lvt-chip lvt-chip-empty">nothing yet</span>');
+        return;
+    }
+
+    const counts = countBySource();
+    const parts = [];
+    if (counts.vector) parts.push(`🔗 ${counts.vector}`);
+    if (counts.keyword) parts.push(`🟢 ${counts.keyword}`);
+    if (counts.constant) parts.push(`🔵 ${counts.constant}`);
+    summary.text(`${lastActivation.length} fired · ${parts.join(' · ')}`);
+
+    for (const item of sortedActivation()) {
+        chips.append(
+            $('<span class="lvt-chip"></span>')
+                .addClass(`lvt-chip-${item.source}`)
+                .attr('title', `${item.world} · ${item.source}`)
+                .text(`${badgeFor(item.source)} ${item.comment}`),
+        );
+    }
+}
+
+/** @returns {{vector: number, keyword: number, constant: number}} */
+function countBySource() {
+    return {
+        vector: lastActivation.filter(x => x.source === 'vector').length,
+        keyword: lastActivation.filter(x => x.source === 'keyword').length,
+        constant: lastActivation.filter(x => x.source === 'constant').length,
+    };
+}
+
+/** Vector hits first — those are the ones worth eyeballing when tuning. */
+function sortedActivation() {
+    const order = { vector: 0, keyword: 1, constant: 2 };
+    return [...lastActivation].sort(
+        (a, b) => order[a.source] - order[b.source] || a.comment.localeCompare(b.comment),
+    );
+}
+
+/**
+ * @param {string} source
+ * @returns {string}
+ */
+function badgeFor(source) {
+    return source === 'vector' ? '🔗' : source === 'constant' ? '🔵' : '🟢';
+}
+
+function addActivationBar() {
+    const html = `
+    <div id="lvt_bar" class="lvt-bar">
+        <div id="lvt_bar_header" class="lvt-bar-header">
+            <span id="lvt_bar_summary" class="lvt-bar-summary">No lorebook entries fired</span>
+            <span id="lvt_bar_toggle" class="lvt-bar-toggle fa-solid fa-chevron-down"></span>
+        </div>
+        <div id="lvt_bar_chips" class="lvt-bar-chips"></div>
+    </div>`;
+
+    $('#chat').before(html);
+
+    const settings = getSettings();
+    $('#lvt_bar').toggle(!!settings.showBar);
+    $('#lvt_bar').toggleClass('lvt-collapsed', !!settings.barCollapsed);
+    $('#lvt_bar_toggle').toggleClass('fa-chevron-down', !!settings.barCollapsed)
+        .toggleClass('fa-chevron-up', !settings.barCollapsed);
+
+    $('#lvt_bar_header').on('click', () => {
+        const s = getSettings();
+        s.barCollapsed = !s.barCollapsed;
+        saveSettingsDebounced();
+        $('#lvt_bar').toggleClass('lvt-collapsed', s.barCollapsed);
+        $('#lvt_bar_toggle')
+            .toggleClass('fa-chevron-down', s.barCollapsed)
+            .toggleClass('fa-chevron-up', !s.barCollapsed);
+    });
 }
 
 /** @returns {string} Currently selected lorebook name in the extension dropdown. */
@@ -843,6 +948,10 @@ function addSettingsPanel() {
                 <input id="lvt_bank_file" type="file" accept="application/json,.json" hidden>
 
                 <div class="lvt-section-label">Last activation</div>
+                <label class="checkbox_label" for="lvt_show_bar">
+                    <input id="lvt_show_bar" type="checkbox">
+                    <span>Show activation bar above chat</span>
+                </label>
                 <div id="lvt_activation_log" class="lvt-log"></div>
 
                 <div id="lvt_status" class="lvt-status"></div>
@@ -906,6 +1015,14 @@ function addSettingsPanel() {
             return `Cleared keywords on ${n} entr${n === 1 ? 'y' : 'ies'} in "${book}".`;
         },
     }));
+
+    $('#lvt_show_bar')
+        .prop('checked', getSettings().showBar)
+        .on('input', function () {
+            getSettings().showBar = !!$(this).prop('checked');
+            saveSettingsDebounced();
+            $('#lvt_bar').toggle(getSettings().showBar);
+        });
 
     $('#lvt_auto_bank')
         .prop('checked', getSettings().autoBank)
@@ -1093,6 +1210,7 @@ function registerCommands() {
 
 jQuery(async () => {
     addSettingsPanel();
+    addActivationBar();
     registerCommands();
     initActivationTracking();
     renderActivationLog();
