@@ -402,12 +402,14 @@ function getSelectedBook() {
 }
 
 /**
- * Loads a lorebook, applies a mutation to every entry, saves and refreshes the editor.
+ * Sets every entry in one lorebook to the Vectorized (🔗) state.
+ *
+ * The entry state is tri-state: constant / normal / vectorized are mutually
+ * exclusive, and the UI reads `constant` first. So setting `vectorized` alone
+ * leaves a constant entry still showing 🔵 — `constant` has to be cleared too.
  * @param {string} name
- * @param {(entry: object) => boolean} mutator Returns true if the entry was changed.
- * @returns {Promise<number>} Number of entries changed.
  */
-async function mutateAllEntries(name, mutator) {
+async function markBookVectorized(name) {
     const data = await loadWorldInfo(name);
 
     if (!data || !data.entries) {
@@ -417,9 +419,15 @@ async function mutateAllEntries(name, mutator) {
     let changed = 0;
 
     for (const entry of Object.values(data.entries)) {
-        if (mutator(entry)) {
-            changed++;
+        if (entry.vectorized === true && entry.constant !== true) {
+            continue;
         }
+
+        entry.constant = false;
+        entry.vectorized = true;
+        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.constant, false);
+        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.vectorized, true);
+        changed++;
     }
 
     if (changed > 0) {
@@ -431,31 +439,34 @@ async function mutateAllEntries(name, mutator) {
 }
 
 /**
- * Sets `vectorized: true` on every entry in one lorebook.
- * @param {string} name
- */
-async function markBookVectorized(name) {
-    return await mutateAllEntries(name, (entry) => {
-        if (entry.vectorized === true) {
-            return false;
-        }
-        entry.vectorized = true;
-        return true;
-    });
-}
-
-/**
- * Sets `vectorized: false` on every entry in one lorebook.
+ * Returns every entry in one lorebook to the Normal (🟢) state.
  * @param {string} name
  */
 async function unmarkBookVectorized(name) {
-    return await mutateAllEntries(name, (entry) => {
+    const data = await loadWorldInfo(name);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${name}"`);
+    }
+
+    let changed = 0;
+
+    for (const entry of Object.values(data.entries)) {
         if (!entry.vectorized) {
-            return false;
+            continue;
         }
+
         entry.vectorized = false;
-        return true;
-    });
+        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.vectorized, false);
+        changed++;
+    }
+
+    if (changed > 0) {
+        await saveWorldInfo(name, data, true);
+        reloadEditor(name);
+    }
+
+    return changed;
 }
 
 /**
