@@ -143,3 +143,19 @@
     text-overflow: ellipsis;
     opacity: 0.8;
 }
+
+.lvt-panel .lvt-log-details {
+    padding: 4px 0 8px 22px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.lvt-panel .lvt-detail {
+    font-size: 0.9em;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+    padding: 2px 0;
+}
+
+.lvt-panel .lvt-detail-dim {
+    opacity: 0.6;
+}

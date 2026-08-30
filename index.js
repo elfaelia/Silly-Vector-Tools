@@ -1,5 +1,5 @@
 import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
-import { extension_settings } from '../../../extensions.js';
+import { extension_settings, getContext } from '../../../extensions.js';
 import {
     world_names,
     loadWorldInfo,
@@ -412,6 +412,60 @@ let lastActivation = [];
 let pendingVectorKeys = new Set();
 let lastActivationAt = null;
 let sawActivationThisGeneration = false;
+/** Query text as the vectors extension builds it — last N non-empty messages. */
+let lastQueryText = '';
+
+/**
+ * Rebuilds the vector query string. Mirrors getQueryText() in the vectors
+ * extension: newest messages first, empties dropped, capped at "Query messages".
+ * @returns {string}
+ */
+function buildQueryText() {
+    const chat = getContext()?.chat ?? [];
+    const count = Number(extension_settings.vectors?.query) || 2;
+
+    return chat
+        .map(x => String(x?.mes ?? '').trim())
+        .filter(Boolean)
+        .reverse()
+        .slice(0, count)
+        .join('\n')
+        .trim();
+}
+
+/**
+ * Re-runs the query with no threshold to find where an entry placed.
+ * The API discards similarity scores, but returns hashes best-match-first,
+ * so position is the closest thing to a score available.
+ * @param {string} world
+ * @param {number} contentHash
+ * @returns {Promise<{rank: number, total: number}>}
+ */
+async function getEntryRank(world, contentHash) {
+    const source = getSource();
+    const response = await fetch('/api/vector/query', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            ...buildVectorsRequestBody(source),
+            collectionId: getWorldCollectionId(world),
+            searchText: lastQueryText,
+            topK: 100,
+            threshold: 0,
+            source,
+        }),
+    });
+
+    if (!response.ok) {
+        throw new Error(`Query failed (HTTP ${response.status})`);
+    }
+
+    const result = await response.json();
+    const hashes = Array.isArray(result?.hashes) ? result.hashes : [];
+    const index = hashes.indexOf(contentHash);
+
+    return { rank: index < 0 ? -1 : index + 1, total: hashes.length };
+}
 
 /**
  * @param {object} entry
@@ -492,6 +546,7 @@ function initActivationTracking() {
     eventSource.on(event_types.GENERATION_STARTED, () => {
         pendingVectorKeys = new Set();
         sawActivationThisGeneration = false;
+        lastQueryText = buildQueryText();
         trace('GENERATION_STARTED');
     });
 
@@ -518,6 +573,8 @@ function initActivationTracking() {
             uid: entry.uid,
             comment: entryLabel(entry),
             full: entry.comment || (Array.isArray(entry.key) ? entry.key.join(', ') : ''),
+            keys: Array.isArray(entry.key) ? [...entry.key] : [],
+            contentHash: entry.content ? getStringHash(entry.content) : null,
             source: entry.constant === true
                 ? 'constant'
                 : pendingVectorKeys.has(entryKey(entry))
@@ -576,15 +633,77 @@ function renderActivationLog() {
         row.append($('<span class="lvt-log-world"></span>').text(item.world));
 
         // No hover on touch, so tapping a row swaps the truncated label for the
-        // full text and wraps it.
+        // full text and reveals why the entry fired.
         const short = item.comment;
         const long = item.full || item.comment;
+        const details = $('<div class="lvt-log-details"></div>').hide();
+
         row.on('click', function () {
             const expanded = $(this).toggleClass('lvt-expanded').hasClass('lvt-expanded');
             $(this).find('.lvt-log-name').text(expanded ? long : short);
+            details.toggle(expanded);
+
+            if (expanded && !details.data('filled')) {
+                details.data('filled', true);
+                fillDetails(details, item);
+            }
         });
 
         container.append(row);
+        container.append(details);
+    }
+}
+
+/**
+ * Explains why one entry fired. Keyword hits get the matched terms; vector hits
+ * get a rank, since no single word triggers them.
+ * @param {JQuery} container
+ * @param {object} item
+ */
+async function fillDetails(container, item) {
+    container.empty();
+
+    if (item.source === 'constant') {
+        container.append('<div class="lvt-detail">🔵 Constant — always inserted, no matching involved.</div>');
+        return;
+    }
+
+    if (item.source === 'keyword') {
+        const haystack = lastQueryText.toLowerCase();
+        const hits = item.keys.filter(k => k && haystack.includes(String(k).toLowerCase()));
+
+        container.append(
+            $('<div class="lvt-detail"></div>').text(
+                hits.length > 0
+                    ? `🟢 Matched: ${hits.join(', ')}`
+                    : '🟢 Keyword match — the matched term is outside the last messages shown here (scan depth covers more).',
+            ),
+        );
+
+        if (item.keys.length > 0) {
+            container.append($('<div class="lvt-detail lvt-detail-dim"></div>').text(`Keys: ${item.keys.join(', ')}`));
+        }
+        return;
+    }
+
+    container.append('<div class="lvt-detail">🔗 No trigger word — matched by similarity against the whole recent conversation.</div>');
+
+    if (item.contentHash === null) {
+        return;
+    }
+
+    const rankLine = $('<div class="lvt-detail lvt-detail-dim">Checking rank…</div>');
+    container.append(rankLine);
+
+    try {
+        const { rank, total } = await getEntryRank(item.world, item.contentHash);
+        rankLine.text(
+            rank < 0
+                ? 'Rank unavailable — entry not in the current query results.'
+                : `Ranked ${rank} of ${total} in its lorebook for this query.`,
+        );
+    } catch (error) {
+        rankLine.text(`Rank lookup failed: ${error.message}`);
     }
 }
 
