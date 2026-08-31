@@ -35,7 +35,7 @@ const CLIENT_SIDE_SOURCES = ['webllm', 'koboldcpp'];
 /** @returns {{banks: Record<string, object[]>, autoBank: boolean, groupUndo: Record<string, object>}} */
 function getSettings() {
     if (!extension_settings[SETTINGS_KEY]) {
-        extension_settings[SETTINGS_KEY] = { banks: {}, autoBank: true, groupUndo: {} };
+        extension_settings[SETTINGS_KEY] = { banks: {}, autoBank: true, autoSync: false, groupUndo: {} };
     }
 
     const settings = extension_settings[SETTINGS_KEY];
@@ -46,6 +46,10 @@ function getSettings() {
 
     if (!settings.groupUndo || typeof settings.groupUndo !== 'object') {
         settings.groupUndo = {};
+    }
+
+    if (typeof settings.autoSync !== 'boolean') {
+        settings.autoSync = false;
     }
 
     if (typeof settings.autoBank !== 'boolean') {
@@ -1474,13 +1478,23 @@ async function listGroups(bookName) {
     return [...map.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 }
 
+/** Big books choke a single insert call, and batching is what makes progress reportable. */
+const VECTOR_BATCH_SIZE = 20;
+
 /**
  * Pushes embeddings for one lorebook into its vector collection immediately,
  * instead of waiting for the next generation to trigger a lazy sync.
+ *
+ * This is a diff, not a rebuild: entries are keyed by a hash of their content,
+ * so unchanged entries are left alone, edited ones get re-embedded and hashes
+ * with no matching entry are dropped. Editing one entry in a 300-entry book
+ * costs one embedding call, not 300 — no purge needed.
+ *
  * @param {string} name
- * @returns {Promise<{inserted: number, deleted: number, skipped: number}>}
+ * @param {(message: string) => void} [onProgress]
+ * @returns {Promise<{inserted: number, deleted: number, skipped: number, unchanged: number}>}
  */
-async function vectorizeBook(name) {
+async function vectorizeBook(name, onProgress = () => {}) {
     const source = getSource();
 
     if (CLIENT_SIDE_SOURCES.includes(source)) {
@@ -1512,7 +1526,7 @@ async function vectorizeBook(name) {
     }
 
     if (eligible.length === 0) {
-        return { inserted: 0, deleted: 0, skipped };
+        return { inserted: 0, deleted: 0, skipped, unchanged: 0 };
     }
 
     const collectionId = getWorldCollectionId(name);
@@ -1520,23 +1534,73 @@ async function vectorizeBook(name) {
 
     const newEntries = eligible.filter(x => !existingHashes.includes(getStringHash(x.content)));
     const staleHashes = existingHashes.filter(h => !eligible.some(e => getStringHash(e.content) === h));
+    const unchanged = eligible.length - newEntries.length;
 
-    if (newEntries.length > 0) {
-        await insertVectorItems(
-            collectionId,
-            newEntries.map(x => ({
-                hash: getStringHash(x.content),
-                text: x.content,
-                index: x.uid,
-            })),
-        );
+    console.log(`${MODULE}: "${name}" — ${newEntries.length} to embed, ${unchanged} unchanged, ${staleHashes.length} stale, ${skipped} skipped`);
+
+    if (newEntries.length === 0 && staleHashes.length === 0) {
+        console.log(`${MODULE}: "${name}" already up to date`);
+        return { inserted: 0, deleted: 0, skipped, unchanged };
+    }
+
+    const items = newEntries.map(x => ({
+        hash: getStringHash(x.content),
+        text: x.content,
+        index: x.uid,
+    }));
+
+    for (let start = 0; start < items.length; start += VECTOR_BATCH_SIZE) {
+        const batch = items.slice(start, start + VECTOR_BATCH_SIZE);
+        const done = Math.min(start + batch.length, items.length);
+
+        onProgress(`Embedding ${done}/${items.length} in "${name}"...`);
+        console.log(`${MODULE}: "${name}" embedding batch ${done}/${items.length}`);
+
+        await insertVectorItems(collectionId, batch);
     }
 
     if (staleHashes.length > 0) {
+        onProgress(`Removing ${staleHashes.length} stale vectors from "${name}"...`);
         await deleteVectorItems(collectionId, staleHashes);
     }
 
-    return { inserted: newEntries.length, deleted: staleHashes.length, skipped };
+    console.log(`${MODULE}: "${name}" done — ${newEntries.length} embedded, ${staleHashes.length} removed`);
+
+    return { inserted: newEntries.length, deleted: staleHashes.length, skipped, unchanged };
+}
+
+/**
+ * Runs the same diff across every lorebook on the server. A book with nothing
+ * to do costs one hash lookup, so this stays cheap to run on a whim.
+ * @param {(message: string) => void} [onProgress]
+ * @returns {Promise<{books: number, touched: number, inserted: number, deleted: number, failed: string[]}>}
+ */
+async function vectorizeAllBooks(onProgress = () => {}) {
+    const totals = { books: 0, touched: 0, inserted: 0, deleted: 0, failed: [] };
+    const names = [...world_names];
+
+    for (const [index, name] of names.entries()) {
+        onProgress(`Checking ${index + 1}/${names.length}: "${name}"...`);
+        totals.books++;
+
+        try {
+            const result = await vectorizeBook(name, onProgress);
+            totals.inserted += result.inserted;
+            totals.deleted += result.deleted;
+
+            if (result.inserted > 0 || result.deleted > 0) {
+                totals.touched++;
+            }
+        } catch (error) {
+            // One bad book shouldn't abandon the other forty.
+            console.error(`${MODULE}: failed to sync "${name}"`, error);
+            totals.failed.push(name);
+        }
+    }
+
+    console.log(`${MODULE}: sync-all finished`, totals);
+
+    return totals;
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,12 +1667,12 @@ function setStatus(message, kind = 'info') {
 
 /**
  * Wraps an action with book validation, confirmation, busy state and error reporting.
- * @param {{ confirmHeader?: string, confirmText?: string, run: (book: string) => Promise<string> }} options
+ * @param {{ confirmHeader?: string, confirmText?: string, requireBook?: boolean, run: (book: string) => Promise<string> }} options
  */
-async function runAction({ confirmHeader, confirmText, run }) {
+async function runAction({ confirmHeader, confirmText, run, requireBook = true }) {
     const book = getSelectedBook();
 
-    if (!book) {
+    if (requireBook && !book) {
         setStatus('Pick a lorebook first.', 'error');
         return;
     }
@@ -1737,6 +1801,63 @@ function renderResultList(container, head, rows) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-sync on save
+//
+// WORLDINFO_UPDATED fires every time a lorebook is written, including by this
+// extension's own bulk tools, so this is debounced and leans on the hash diff
+// to make no-op saves cost a single lookup.
+// ---------------------------------------------------------------------------
+
+const AUTO_SYNC_DELAY = 4000;
+/** @type {Map<string, number>} */
+const autoSyncTimers = new Map();
+let autoSyncRunning = false;
+
+/** @param {string} name */
+function queueAutoSync(name) {
+    if (!name || !getSettings().autoSync) {
+        return;
+    }
+
+    clearTimeout(autoSyncTimers.get(name));
+
+    autoSyncTimers.set(name, setTimeout(async () => {
+        autoSyncTimers.delete(name);
+
+        // Editing several books in a row shouldn't overlap embedding calls.
+        if (autoSyncRunning) {
+            queueAutoSync(name);
+            return;
+        }
+
+        try {
+            autoSyncRunning = true;
+            const { inserted, deleted } = await vectorizeBook(name, message => setStatus(message));
+
+            if (inserted > 0 || deleted > 0) {
+                const summary = `Auto-synced "${name}": ${inserted} embedded, ${deleted} removed.`;
+                setStatus(summary, 'success');
+                toastr.success(summary, 'Lorebook Vector Tools');
+            }
+        } catch (error) {
+            console.error(`${MODULE}: auto-sync failed for "${name}"`, error);
+            setStatus(`Auto-sync failed for "${name}": ${error.message ?? error}`, 'error');
+        } finally {
+            autoSyncRunning = false;
+        }
+    }, AUTO_SYNC_DELAY));
+}
+
+function initAutoSync() {
+    if (!event_types.WORLDINFO_UPDATED) {
+        console.warn(`${MODULE}: this SillyTavern build has no WORLDINFO_UPDATED event, auto-sync unavailable`);
+        return;
+    }
+
+    eventSource.on(event_types.WORLDINFO_UPDATED, (name) => queueAutoSync(String(name ?? '')));
+}
+
 function addSettingsPanel() {
     const html = `
     <div id="lvt_panel" class="lvt-panel">
@@ -1758,6 +1879,13 @@ function addSettingsPanel() {
                     <button id="lvt_mark" class="menu_button">Mark all entries vectorized</button>
                     <button id="lvt_unmark" class="menu_button">Unmark all entries</button>
                     <button id="lvt_vectorize" class="menu_button">Vectorize this lorebook now</button>
+                    <button id="lvt_vectorize_all" class="menu_button">Sync every lorebook now</button>
+                </div>
+                <label class="checkbox_label" for="lvt_auto_sync">
+                    <input id="lvt_auto_sync" type="checkbox">
+                    <span>Auto-sync a lorebook when it's saved</span>
+                </label>
+                <div class="lvt-buttons">
                     <button id="lvt_purge" class="menu_button lvt-danger">Purge this lorebook's vectors</button>
                 </div>
 
@@ -1981,13 +2109,37 @@ function addSettingsPanel() {
 
     $('#lvt_vectorize').on('click', () => runAction({
         run: async (book) => {
-            const { inserted, deleted, skipped } = await vectorizeBook(book);
+            const { inserted, deleted, skipped, unchanged } = await vectorizeBook(book, message => setStatus(message));
             if (inserted === 0 && deleted === 0) {
-                return `"${book}" is already up to date (${skipped} entr${skipped === 1 ? 'y' : 'ies'} skipped).`;
+                return `"${book}" is already up to date — ${unchanged} embedded, ${skipped} skipped.`;
             }
-            return `"${book}": ${inserted} embedded, ${deleted} stale removed, ${skipped} skipped.`;
+            return `"${book}": ${inserted} embedded, ${deleted} stale removed, ${unchanged} unchanged, ${skipped} skipped.`;
         },
     }));
+
+    $('#lvt_vectorize_all').on('click', () => runAction({
+        requireBook: false,
+        confirmHeader: 'Sync every lorebook?',
+        confirmText: 'Checks all lorebooks and embeds anything that changed. Books already up to date cost one lookup each and are skipped.',
+        run: async () => {
+            const { books, touched, inserted, deleted, failed } = await vectorizeAllBooks(message => setStatus(message));
+            const problems = failed.length > 0 ? ` ${failed.length} failed — see console.` : '';
+            if (touched === 0) {
+                return `All ${books} lorebooks already up to date.${problems}`;
+            }
+            return `${touched} of ${books} lorebooks updated: ${inserted} embedded, ${deleted} removed.${problems}`;
+        },
+    }));
+
+    $('#lvt_auto_sync')
+        .prop('checked', getSettings().autoSync)
+        .on('input', function () {
+            getSettings().autoSync = !!$(this).prop('checked');
+            saveSettingsDebounced();
+            setStatus(getSettings().autoSync
+                ? 'Auto-sync on: saving a lorebook re-embeds what changed.'
+                : 'Auto-sync off.');
+        });
 
     $('#lvt_purge').on('click', () => runAction({
         confirmHeader: 'Purge vectors?',
@@ -2462,6 +2614,16 @@ function registerCommands() {
     }));
 
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lvt-sync-all',
+        helpString: 'Re-embeds anything that changed in every lorebook. Progress goes to the browser console.',
+        returns: 'summary of the sync',
+        callback: async () => {
+            const { books, touched, inserted, deleted, failed } = await vectorizeAllBooks();
+            return `${touched}/${books} books updated, ${inserted} embedded, ${deleted} removed, ${failed.length} failed`;
+        },
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lvt-purge',
         helpString: 'Deletes stored embeddings for the named lorebook.',
         unnamedArgumentList: [bookArgument()],
@@ -2476,6 +2638,7 @@ jQuery(async () => {
     addSettingsPanel();
     registerCommands();
     initActivationTracking();
+    initAutoSync();
     renderActivationLog();
     renderTrace();
     console.log(`${MODULE}: loaded`);
