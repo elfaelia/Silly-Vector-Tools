@@ -32,10 +32,10 @@ const CLIENT_SIDE_SOURCES = ['webllm', 'koboldcpp'];
 // first, falling back to a content hash so a re-imported book still restores.
 // ---------------------------------------------------------------------------
 
-/** @returns {{banks: Record<string, object[]>, autoBank: boolean, groupUndo: Record<string, object>}} */
+/** @returns {{banks: Record<string, object[]>, autoBank: boolean, groupUndo: Record<string, object>, openSections: Record<string, boolean>}} */
 function getSettings() {
     if (!extension_settings[SETTINGS_KEY]) {
-        extension_settings[SETTINGS_KEY] = { banks: {}, autoBank: true, autoSync: false, groupUndo: {} };
+        extension_settings[SETTINGS_KEY] = { banks: {}, autoBank: true, autoSync: false, groupUndo: {}, openSections: {} };
     }
 
     const settings = extension_settings[SETTINGS_KEY];
@@ -50,6 +50,10 @@ function getSettings() {
 
     if (typeof settings.autoSync !== 'boolean') {
         settings.autoSync = false;
+    }
+
+    if (!settings.openSections || typeof settings.openSections !== 'object') {
+        settings.openSections = {};
     }
 
     if (typeof settings.autoBank !== 'boolean') {
@@ -476,6 +480,83 @@ async function getEntryRank(world, contentHash) {
 }
 
 /**
+ * Runs one query at a given threshold and reports whether the entry survived
+ * the server's filter.
+ * @param {string} world
+ * @param {number} contentHash
+ * @param {number} threshold
+ * @returns {Promise<boolean>}
+ */
+async function scoresAtLeast(world, contentHash, threshold) {
+    const source = getSource();
+    const response = await fetch('/api/vector/query', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            ...buildVectorsRequestBody(source),
+            collectionId: getWorldCollectionId(world),
+            searchText: lastQueryText,
+            topK: 100,
+            threshold,
+            source,
+        }),
+    });
+
+    if (!response.ok) {
+        throw new Error(`Query failed (HTTP ${response.status})`);
+    }
+
+    const result = await response.json();
+    const metadata = Array.isArray(result?.metadata) ? result.metadata : [];
+
+    return metadata.some(x => Number(x?.hash) === contentHash);
+}
+
+/**
+ * Recovers an entry's actual similarity score.
+ *
+ * queryCollection() computes a score per item, filters `metadata` by it, then
+ * returns only hashes and metadata — the score itself never leaves the server.
+ * But `metadata` is threshold-filtered while `hashes` is not, so whether the
+ * entry appears in `metadata` at threshold T answers "is the score >= T?".
+ * Bisecting on that recovers the number without patching SillyTavern.
+ *
+ * Each probe re-embeds the query text server-side (getVector has no cache), so
+ * this is deliberately capped rather than run for every entry automatically.
+ *
+ * @param {string} world
+ * @param {number} contentHash
+ * @param {(message: string) => void} [onProgress]
+ * @returns {Promise<{score: number, precision: number, probes: number} | null>}
+ */
+async function measureSimilarity(world, contentHash, onProgress = () => {}) {
+    // Threshold 0 is treated as "no threshold" by the endpoint's `|| 0.0`
+    // fallback, so a tiny epsilon stands in for the bottom of the range.
+    if (!await scoresAtLeast(world, contentHash, 0.0001)) {
+        return null;
+    }
+
+    let low = 0;
+    let high = 1;
+    let probes = 1;
+
+    // 8 halvings lands inside ±0.004, which is finer than the threshold slider.
+    for (let step = 0; step < 8; step++) {
+        const mid = (low + high) / 2;
+        onProgress(`Probing ${mid.toFixed(3)}…`);
+        probes++;
+
+        if (await scoresAtLeast(world, contentHash, mid)) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+
+    return { score: (low + high) / 2, precision: (high - low) / 2, probes };
+}
+
+/**
  * @param {object} entry
  * @returns {string}
  */
@@ -713,6 +794,44 @@ async function fillDetails(container, item) {
     } catch (error) {
         rankLine.text(`Rank lookup failed: ${error.message}`);
     }
+
+    // Not automatic: each measurement costs ~9 short embedding calls, and the
+    // log can hold a dozen vector hits at once.
+    const scoreLine = $('<div class="lvt-detail lvt-detail-dim"></div>');
+    const scoreButton = $('<button class="menu_button lvt-measure">Measure similarity</button>');
+
+    scoreButton.on('click', async (event) => {
+        event.stopPropagation();
+        scoreButton.prop('disabled', true);
+        scoreLine.text('Measuring…');
+
+        try {
+            const result = await measureSimilarity(
+                item.world,
+                item.contentHash,
+                message => scoreLine.text(message),
+            );
+
+            if (!result) {
+                scoreLine.text('Below the measurable range — scored under 0.0001 for this query.');
+                return;
+            }
+
+            const threshold = Number(extension_settings.vectors?.score_threshold);
+            const margin = Number.isFinite(threshold)
+                ? ` — your threshold is ${threshold}, so it cleared by ${(result.score - threshold).toFixed(3)}.`
+                : '';
+
+            scoreLine.text(`Similarity ≈ ${result.score.toFixed(3)} (±${result.precision.toFixed(3)})${margin}`);
+        } catch (error) {
+            scoreLine.text(`Measurement failed: ${error.message}`);
+        } finally {
+            scoreButton.prop('disabled', false);
+        }
+    });
+
+    container.append(scoreButton);
+    container.append(scoreLine);
 }
 
 /** @returns {{vector: number, keyword: number, constant: number}} */
@@ -1849,6 +1968,26 @@ function queueAutoSync(name) {
     }, AUTO_SYNC_DELAY));
 }
 
+/**
+ * Reopens whatever was open last session. Everything starts collapsed, so a
+ * fresh install shows five headers instead of a wall of controls.
+ */
+function restoreSectionState() {
+    const open = getSettings().openSections;
+
+    for (const [id, isOpen] of Object.entries(open)) {
+        if (!isOpen) {
+            continue;
+        }
+
+        const drawer = $(`#lvt_panel .lvt-section[data-section="${id}"]`);
+        drawer.find('> .inline-drawer-header .inline-drawer-icon')
+            .removeClass('down fa-circle-chevron-down')
+            .addClass('up fa-circle-chevron-up');
+        drawer.find('> .inline-drawer-content').show();
+    }
+}
+
 function initAutoSync() {
     if (!event_types.WORLDINFO_UPDATED) {
         console.warn(`${MODULE}: this SillyTavern build has no WORLDINFO_UPDATED event, auto-sync unavailable`);
@@ -1859,6 +1998,268 @@ function initAutoSync() {
 }
 
 function addSettingsPanel() {
+    const section = (id, icon, title, subtitle, body) => `
+        <div class="inline-drawer lvt-section" data-section="${id}">
+            <div class="inline-drawer-toggle inline-drawer-header lvt-section-header">
+                <div class="lvt-section-title">
+                    <i class="fa-solid ${icon}"></i>
+                    <span>${title}</span>
+                    <small class="lvt-section-sub">${subtitle}</small>
+                </div>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content lvt-section-body">${body}</div>
+        </div>`;
+
+    const vectorising = `
+        <div class="lvt-buttons">
+            <button id="lvt_vectorize" class="menu_button lvt-primary">Sync this lorebook</button>
+            <button id="lvt_stats" class="menu_button">Show counts</button>
+        </div>
+        <div class="lvt-hint">Sync embeds anything you've edited since last time. Unchanged entries are skipped, so it's quick to re-run.</div>
+
+        <label class="checkbox_label" for="lvt_auto_sync">
+            <input id="lvt_auto_sync" type="checkbox">
+            <span>Sync automatically when a lorebook is saved</span>
+        </label>
+
+        <div class="lvt-subhead">Everything at once</div>
+        <div class="lvt-buttons">
+            <button id="lvt_vectorize_all" class="menu_button">Sync every lorebook</button>
+            <button id="lvt_mark" class="menu_button">Mark all entries vectorized</button>
+            <button id="lvt_unmark" class="menu_button">Unmark all entries</button>
+        </div>
+        <div class="lvt-hint"><b>Vectorized</b> entries activate by meaning rather than by keyword — they fire when the conversation is <i>about</i> them, with no trigger word needed.</div>
+
+        <div class="lvt-subhead lvt-subhead-danger">Destructive</div>
+        <div class="lvt-buttons">
+            <button id="lvt_purge" class="menu_button lvt-danger">Purge this lorebook's vectors</button>
+        </div>
+        <div class="lvt-hint">Deletes the stored embeddings. The entries themselves are untouched and a sync rebuilds them.</div>`;
+
+    const grouping = `
+        <div class="lvt-hint">Grouped entries compete instead of stacking: however many match, only one gets inserted. This is the fix for a lorebook where too much fires at once.</div>
+
+        <div class="lvt-field">
+            <label for="lvt_group_terms">Words to match</label>
+            <input id="lvt_group_terms" class="text_pole" type="text" placeholder="dorm, cafeteria, infirmary">
+            <div class="lvt-hint">Comma-separated. Every entry containing any of these gets grouped.</div>
+        </div>
+
+        <div class="lvt-field">
+            <label for="lvt_group_name">Group name</label>
+            <input id="lvt_group_name" class="text_pole" type="text" placeholder="leave blank to name groups after each word">
+        </div>
+
+        <div class="lvt-field">
+            <label for="lvt_group_allow">Let this many through per turn</label>
+            <input id="lvt_group_allow" class="text_pole" type="number" min="1" max="20" step="1" value="1">
+            <div class="lvt-hint">Above 1, matches are split into that many pools so more than one can fire.</div>
+        </div>
+
+        <div class="lvt-buttons">
+            <button id="lvt_group_preview" class="menu_button">Preview matches</button>
+            <button id="lvt_group_apply" class="menu_button lvt-primary">Group them</button>
+        </div>
+        <div id="lvt_group_results" class="lvt-log lvt-preview"></div>
+
+        <div class="inline-drawer lvt-subsection">
+            <div class="inline-drawer-toggle inline-drawer-header lvt-subsection-header">
+                <span>Search options</span>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <div class="lvt-checkgrid">
+                    <label class="checkbox_label" for="lvt_group_in_title">
+                        <input id="lvt_group_in_title" type="checkbox" checked>
+                        <span>Title</span>
+                    </label>
+                    <label class="checkbox_label" for="lvt_group_in_keys">
+                        <input id="lvt_group_in_keys" type="checkbox" checked>
+                        <span>Keywords</span>
+                    </label>
+                    <label class="checkbox_label" for="lvt_group_in_content">
+                        <input id="lvt_group_in_content" type="checkbox" checked>
+                        <span>Content</span>
+                    </label>
+                    <label class="checkbox_label" for="lvt_group_whole_word">
+                        <input id="lvt_group_whole_word" type="checkbox" checked>
+                        <span>Whole words</span>
+                    </label>
+                    <label class="checkbox_label" for="lvt_group_case">
+                        <input id="lvt_group_case" type="checkbox">
+                        <span>Match case</span>
+                    </label>
+                    <label class="checkbox_label" for="lvt_group_skip_disabled">
+                        <input id="lvt_group_skip_disabled" type="checkbox" checked>
+                        <span>Skip disabled</span>
+                    </label>
+                </div>
+                <div class="lvt-field">
+                    <label for="lvt_group_mode">If an entry is already grouped</label>
+                    <select id="lvt_group_mode" class="text_pole">
+                        <option value="replace">Replace its groups</option>
+                        <option value="append">Add this group alongside</option>
+                        <option value="fill">Leave it alone</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="inline-drawer lvt-subsection">
+            <div class="inline-drawer-toggle inline-drawer-header lvt-subsection-header">
+                <span>Who wins the group</span>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <label class="checkbox_label" for="lvt_group_apply_settings">
+                    <input id="lvt_group_apply_settings" type="checkbox" checked>
+                    <span>Apply these settings too</span>
+                </label>
+                <label class="checkbox_label" for="lvt_group_prioritize">
+                    <input id="lvt_group_prioritize" type="checkbox">
+                    <span>Prioritize — always beats its group</span>
+                </label>
+                <div class="lvt-field">
+                    <label for="lvt_group_weight">Weight</label>
+                    <input id="lvt_group_weight" class="text_pole" type="number" min="1" max="10000" step="1" value="100">
+                    <div class="lvt-hint">Odds of winning. An entry at 200 wins twice as often as one at 100.</div>
+                </div>
+                <div class="lvt-field">
+                    <label for="lvt_group_scoring">Scoring</label>
+                    <select id="lvt_group_scoring" class="text_pole">
+                        <option value="default">Use global setting</option>
+                        <option value="on">On — most keyword hits wins</option>
+                        <option value="off">Off — roll the dice</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="lvt-subhead">Other actions</div>
+        <div class="lvt-buttons">
+            <button id="lvt_group_list" class="menu_button">List existing groups</button>
+            <button id="lvt_group_undo" class="menu_button">Undo last bulk change</button>
+            <button id="lvt_group_clear" class="menu_button lvt-danger">Ungroup matching entries</button>
+        </div>`;
+
+    const placement = `
+        <div class="lvt-hint">Where entries land in the prompt. Closer to the end of the chat means more influence on the next reply.</div>
+
+        <div class="lvt-field">
+            <label for="lvt_place_filter">Apply to</label>
+            <select id="lvt_place_filter" class="text_pole">
+                <option value="all">Every entry</option>
+                <option value="vectorized">Vectorized only</option>
+                <option value="notVectorized">Keyword-only</option>
+                <option value="constant">Constant only</option>
+                <option value="grouped">Grouped only</option>
+                <option value="matching">Matching the words in Grouping</option>
+            </select>
+            <label class="checkbox_label" for="lvt_place_skip_disabled">
+                <input id="lvt_place_skip_disabled" type="checkbox" checked>
+                <span>Skip disabled entries</span>
+            </label>
+        </div>
+
+        <div class="lvt-field">
+            <label class="checkbox_label" for="lvt_place_set_position">
+                <input id="lvt_place_set_position" type="checkbox" checked>
+                <span>Set position</span>
+            </label>
+            <select id="lvt_place_position" class="text_pole">
+                <option value="4" selected>@Depth — inside the chat</option>
+                <option value="0">↑Char — before character card</option>
+                <option value="1">↓Char — after character card</option>
+                <option value="2">↑AN — before author's note</option>
+                <option value="3">↓AN — after author's note</option>
+                <option value="5">↑EM — before example messages</option>
+                <option value="6">↓EM — after example messages</option>
+            </select>
+        </div>
+
+        <div class="lvt-grid">
+            <div class="lvt-field">
+                <label for="lvt_place_role">Role</label>
+                <select id="lvt_place_role" class="text_pole">
+                    <option value="0">System</option>
+                    <option value="1">User</option>
+                    <option value="2">Assistant</option>
+                </select>
+            </div>
+            <div class="lvt-field">
+                <label class="checkbox_label" for="lvt_place_set_depth">
+                    <input id="lvt_place_set_depth" type="checkbox" checked>
+                    <span>Depth</span>
+                </label>
+                <input id="lvt_place_depth" class="text_pole" type="number" min="0" max="9999" step="1" value="4">
+            </div>
+        </div>
+        <div class="lvt-hint">Role and depth only apply at @Depth. Depth counts back from the newest message — 1 is right before the reply, higher sits further back.</div>
+
+        <div class="lvt-grid">
+            <div class="lvt-field">
+                <label class="checkbox_label" for="lvt_place_set_order">
+                    <input id="lvt_place_set_order" type="checkbox">
+                    <span>Order</span>
+                </label>
+                <input id="lvt_place_order" class="text_pole" type="number" min="0" max="99999" step="1" value="100">
+            </div>
+            <div class="lvt-field">
+                <label for="lvt_place_order_step">Step per entry</label>
+                <input id="lvt_place_order_step" class="text_pole" type="number" min="-100" max="100" step="1" value="0">
+            </div>
+        </div>
+        <div class="lvt-hint">Insertion order breaks ties between entries in the same spot — lower goes in first. Step numbers them in sequence instead of giving them all the same value.</div>
+
+        <div class="lvt-buttons">
+            <button id="lvt_place_summary" class="menu_button">Show current placement</button>
+            <button id="lvt_place_apply" class="menu_button lvt-primary">Apply placement</button>
+            <button id="lvt_place_undo" class="menu_button">Undo last bulk change</button>
+        </div>
+        <div id="lvt_place_results" class="lvt-log lvt-preview"></div>`;
+
+    const keywords = `
+        <div class="lvt-field">
+            <label for="lvt_bank_select">Saved keyword sets</label>
+            <select id="lvt_bank_select" class="text_pole"></select>
+        </div>
+        <div class="lvt-buttons">
+            <button id="lvt_bank_save" class="menu_button">Save current keywords</button>
+            <button id="lvt_bank_restore" class="menu_button">Restore selected</button>
+            <button id="lvt_bank_export" class="menu_button">Export to file</button>
+            <button id="lvt_bank_import" class="menu_button">Import from file</button>
+            <button id="lvt_bank_delete" class="menu_button lvt-danger">Delete selected</button>
+        </div>
+        <input id="lvt_bank_file" type="file" accept="application/json,.json" hidden>
+
+        <div class="lvt-subhead lvt-subhead-danger">Clear keywords</div>
+        <div class="lvt-hint">Strips trigger words so entries rely on similarity alone. Permanent — save a set first.</div>
+        <div class="lvt-checkgrid">
+            <label class="checkbox_label" for="lvt_include_secondary">
+                <input id="lvt_include_secondary" type="checkbox" checked>
+                <span>Secondary too</span>
+            </label>
+            <label class="checkbox_label" for="lvt_auto_bank">
+                <input id="lvt_auto_bank" type="checkbox" checked>
+                <span>Back up first</span>
+            </label>
+        </div>
+        <div class="lvt-buttons">
+            <button id="lvt_clear_keys" class="menu_button lvt-danger">Clear all keywords</button>
+        </div>`;
+
+    const activity = `
+        <div class="lvt-subhead">Last activation</div>
+        <div id="lvt_activation_log" class="lvt-log"></div>
+        <div class="lvt-hint">Tap an entry to see why it fired. Vector hits can be measured for similarity.</div>
+
+        <div class="lvt-subhead">Event trace</div>
+        <div id="lvt_trace" class="lvt-log lvt-trace"></div>
+        <div class="lvt-buttons">
+            <button id="lvt_trace_copy" class="menu_button">Copy trace</button>
+        </div>`;
+
     const html = `
     <div id="lvt_panel" class="lvt-panel">
         <div class="inline-drawer">
@@ -1867,205 +2268,41 @@ function addSettingsPanel() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <label for="lvt_book_select">Lorebook</label>
-                <div class="lvt-row">
-                    <select id="lvt_book_select" class="text_pole flex1"></select>
-                    <div id="lvt_refresh" class="menu_button fa-solid fa-rotate" title="Refresh list"></div>
+                <div class="lvt-book">
+                    <label for="lvt_book_select">Lorebook</label>
+                    <div class="lvt-row">
+                        <select id="lvt_book_select" class="text_pole flex1"></select>
+                        <div id="lvt_refresh" class="menu_button fa-solid fa-rotate" title="Refresh list"></div>
+                    </div>
+                    <div id="lvt_status" class="lvt-status"></div>
                 </div>
 
-                <div class="lvt-section-label">Vectorising</div>
-                <div class="lvt-buttons">
-                    <button id="lvt_stats" class="menu_button">Show counts for this lorebook</button>
-                    <button id="lvt_mark" class="menu_button">Mark all entries vectorized</button>
-                    <button id="lvt_unmark" class="menu_button">Unmark all entries</button>
-                    <button id="lvt_vectorize" class="menu_button">Vectorize this lorebook now</button>
-                    <button id="lvt_vectorize_all" class="menu_button">Sync every lorebook now</button>
-                </div>
-                <label class="checkbox_label" for="lvt_auto_sync">
-                    <input id="lvt_auto_sync" type="checkbox">
-                    <span>Auto-sync a lorebook when it's saved</span>
-                </label>
-                <div class="lvt-buttons">
-                    <button id="lvt_purge" class="menu_button lvt-danger">Purge this lorebook's vectors</button>
-                </div>
-
-                <div class="lvt-section-label">Keywords</div>
-                <label class="checkbox_label" for="lvt_include_secondary">
-                    <input id="lvt_include_secondary" type="checkbox" checked>
-                    <span>Also clear secondary keywords</span>
-                </label>
-                <label class="checkbox_label" for="lvt_auto_bank">
-                    <input id="lvt_auto_bank" type="checkbox" checked>
-                    <span>Auto-save keywords before clearing</span>
-                </label>
-                <div class="lvt-buttons">
-                    <button id="lvt_clear_keys" class="menu_button lvt-danger">Clear all keywords in this lorebook</button>
-                </div>
-
-                <div class="lvt-section-label">Bulk grouping</div>
-                <label for="lvt_group_terms">Words to match (comma-separated)</label>
-                <input id="lvt_group_terms" class="text_pole" type="text" placeholder="e.g. dorm, cafeteria, infirmary">
-                <label for="lvt_group_name">Group name</label>
-                <input id="lvt_group_name" class="text_pole" type="text" placeholder="blank = one group per matched word">
-                <label for="lvt_group_allow">Let this many through per turn</label>
-                <input id="lvt_group_allow" class="text_pole" type="number" min="1" max="20" step="1" value="1">
-                <label for="lvt_group_mode">If an entry is already grouped</label>
-                <select id="lvt_group_mode" class="text_pole">
-                    <option value="replace">Replace its groups</option>
-                    <option value="append">Add this group alongside</option>
-                    <option value="fill">Leave it alone (only group ungrouped entries)</option>
-                </select>
-                <div class="lvt-section-label">Look in</div>
-                <label class="checkbox_label" for="lvt_group_in_title">
-                    <input id="lvt_group_in_title" type="checkbox" checked>
-                    <span>Title / memo</span>
-                </label>
-                <label class="checkbox_label" for="lvt_group_in_keys">
-                    <input id="lvt_group_in_keys" type="checkbox" checked>
-                    <span>Keywords</span>
-                </label>
-                <label class="checkbox_label" for="lvt_group_in_content">
-                    <input id="lvt_group_in_content" type="checkbox" checked>
-                    <span>Content</span>
-                </label>
-                <label class="checkbox_label" for="lvt_group_whole_word">
-                    <input id="lvt_group_whole_word" type="checkbox" checked>
-                    <span>Whole words only</span>
-                </label>
-                <label class="checkbox_label" for="lvt_group_case">
-                    <input id="lvt_group_case" type="checkbox">
-                    <span>Case sensitive</span>
-                </label>
-                <label class="checkbox_label" for="lvt_group_skip_disabled">
-                    <input id="lvt_group_skip_disabled" type="checkbox" checked>
-                    <span>Skip disabled entries</span>
-                </label>
-                <div class="lvt-section-label">Group settings to apply</div>
-                <label class="checkbox_label" for="lvt_group_apply_settings">
-                    <input id="lvt_group_apply_settings" type="checkbox" checked>
-                    <span>Also set priority / weight / scoring below</span>
-                </label>
-                <label class="checkbox_label" for="lvt_group_prioritize">
-                    <input id="lvt_group_prioritize" type="checkbox">
-                    <span>Prioritize (this entry wins its group)</span>
-                </label>
-                <label for="lvt_group_weight">Group weight</label>
-                <input id="lvt_group_weight" class="text_pole" type="number" min="1" max="10000" step="1" value="100">
-                <label for="lvt_group_scoring">Group scoring</label>
-                <select id="lvt_group_scoring" class="text_pole">
-                    <option value="default">Use global setting</option>
-                    <option value="on">On — most keyword hits wins</option>
-                    <option value="off">Off</option>
-                </select>
-                <div class="lvt-buttons">
-                    <button id="lvt_group_preview" class="menu_button">Preview matches</button>
-                    <button id="lvt_group_apply" class="menu_button">Group matching entries</button>
-                    <button id="lvt_group_list" class="menu_button">List groups in this lorebook</button>
-                    <button id="lvt_group_undo" class="menu_button">Undo last grouping change</button>
-                    <button id="lvt_group_clear" class="menu_button lvt-danger">Ungroup matching entries</button>
-                </div>
-                <div id="lvt_group_results" class="lvt-log lvt-preview"></div>
-                <small class="lvt-note">
-                    Grouped entries still activate as normal — SillyTavern inserts
-                    exactly one member per group per turn. To let more than one
-                    through, raise "let this many through" and the matches are split
-                    into that many numbered pools, one winner each. Weight decides
-                    the odds within a pool; prioritize overrides them.
-                </small>
-
-                <div class="lvt-section-label">Bulk placement</div>
-                <label for="lvt_place_filter">Apply to</label>
-                <select id="lvt_place_filter" class="text_pole">
-                    <option value="all">Every entry in this lorebook</option>
-                    <option value="vectorized">Vectorized entries only</option>
-                    <option value="notVectorized">Keyword-only entries</option>
-                    <option value="constant">Constant entries only</option>
-                    <option value="grouped">Grouped entries only</option>
-                    <option value="matching">Entries matching the words above</option>
-                </select>
-                <label class="checkbox_label" for="lvt_place_skip_disabled">
-                    <input id="lvt_place_skip_disabled" type="checkbox" checked>
-                    <span>Skip disabled entries</span>
-                </label>
-
-                <label class="checkbox_label" for="lvt_place_set_position">
-                    <input id="lvt_place_set_position" type="checkbox" checked>
-                    <span>Set position</span>
-                </label>
-                <select id="lvt_place_position" class="text_pole">
-                    <option value="0">↑Char — before character definitions</option>
-                    <option value="1">↓Char — after character definitions</option>
-                    <option value="2">↑AN — before author's note</option>
-                    <option value="3">↓AN — after author's note</option>
-                    <option value="4" selected>@Depth — in the chat at a depth</option>
-                    <option value="5">↑EM — before example messages</option>
-                    <option value="6">↓EM — after example messages</option>
-                </select>
-                <label for="lvt_place_role">Role (@Depth only)</label>
-                <select id="lvt_place_role" class="text_pole">
-                    <option value="0">System</option>
-                    <option value="1">User</option>
-                    <option value="2">Assistant</option>
-                </select>
-
-                <label class="checkbox_label" for="lvt_place_set_depth">
-                    <input id="lvt_place_set_depth" type="checkbox" checked>
-                    <span>Set depth (@Depth only)</span>
-                </label>
-                <input id="lvt_place_depth" class="text_pole" type="number" min="0" max="9999" step="1" value="4">
-
-                <label class="checkbox_label" for="lvt_place_set_order">
-                    <input id="lvt_place_set_order" type="checkbox">
-                    <span>Set insertion order</span>
-                </label>
-                <input id="lvt_place_order" class="text_pole" type="number" min="0" max="99999" step="1" value="100">
-                <label for="lvt_place_order_step">Step per entry (0 = same order for all)</label>
-                <input id="lvt_place_order_step" class="text_pole" type="number" min="-100" max="100" step="1" value="0">
-
-                <div class="lvt-buttons">
-                    <button id="lvt_place_summary" class="menu_button">Show current placement</button>
-                    <button id="lvt_place_apply" class="menu_button">Apply placement</button>
-                    <button id="lvt_place_undo" class="menu_button">Undo last bulk change</button>
-                </div>
-                <div id="lvt_place_results" class="lvt-log lvt-preview"></div>
-                <small class="lvt-note">
-                    Depth and role only apply at @Depth — a higher depth number sits
-                    further back in the chat. Insertion order breaks ties between
-                    entries in the same place: lower goes in first.
-                </small>
-
-                <div class="lvt-section-label">Saved keyword sets</div>
-                <div class="lvt-row">
-                    <select id="lvt_bank_select" class="text_pole flex1"></select>
-                </div>
-                <div class="lvt-buttons">
-                    <button id="lvt_bank_save" class="menu_button">Save current keywords</button>
-                    <button id="lvt_bank_restore" class="menu_button">Restore selected set</button>
-                    <button id="lvt_bank_export" class="menu_button">Export selected to file</button>
-                    <button id="lvt_bank_import" class="menu_button">Import from file</button>
-                    <button id="lvt_bank_delete" class="menu_button lvt-danger">Delete selected set</button>
-                </div>
-                <input id="lvt_bank_file" type="file" accept="application/json,.json" hidden>
-
-                <div class="lvt-section-label">Last activation</div>
-                <div id="lvt_activation_log" class="lvt-log"></div>
-
-                <div class="lvt-section-label">Event trace</div>
-                <div id="lvt_trace" class="lvt-log lvt-trace"></div>
-                <div class="lvt-buttons">
-                    <button id="lvt_trace_copy" class="menu_button">Copy trace</button>
-                </div>
-
-                <div id="lvt_status" class="lvt-status"></div>
-                <small class="lvt-note">
-                    Entries only activate by similarity if they're marked vectorized.
-                    Clearing keywords is permanent — export a backup first.
-                </small>
+                ${section('vectors', 'fa-cube', 'Vectorising', 'embed and sync', vectorising)}
+                ${section('grouping', 'fa-layer-group', 'Grouping', 'stop entries stacking', grouping)}
+                ${section('placement', 'fa-arrows-up-down', 'Placement', 'position, depth, order', placement)}
+                ${section('keywords', 'fa-key', 'Keywords', 'clear and back up', keywords)}
+                ${section('activity', 'fa-wave-square', 'Activity', 'what fired last turn', activity)}
             </div>
         </div>
     </div>`;
 
     $('#extensions_settings2').append(html);
+
+    restoreSectionState();
+
+    // Remember which sections were left open. The delegated handler in
+    // script.js does the animation; this just records the outcome after it.
+    $('#lvt_panel').on('inline-drawer-toggle', '.lvt-section', function () {
+        const id = String($(this).data('section') ?? '');
+
+        if (!id) {
+            return;
+        }
+
+        const open = $(this).find('> .inline-drawer-header .inline-drawer-icon').hasClass('up');
+        getSettings().openSections[id] = open;
+        saveSettingsDebounced();
+    });
 
     $('#lvt_refresh').on('click', () => {
         refreshBookList();

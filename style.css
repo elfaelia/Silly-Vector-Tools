@@ -1,8 +1,18 @@
+/* Everything here leans on SillyTavern's own theme variables rather than fixed
+   colours, so the panel follows whatever theme is loaded. */
+
+/* --- Lorebook picker, pinned above the sections ------------------------- */
+
+.lvt-panel .lvt-book {
+    padding-bottom: 8px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+}
+
 .lvt-panel .lvt-row {
     display: flex;
     align-items: center;
     gap: 5px;
-    margin-bottom: 8px;
 }
 
 .lvt-panel .lvt-row .flex1 {
@@ -10,20 +20,153 @@
     min-width: 0;
 }
 
-.lvt-panel .lvt-section-label {
-    font-weight: bold;
-    opacity: 0.8;
-    margin: 10px 0 4px;
-    font-size: 0.9em;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+/* --- Sections ----------------------------------------------------------- */
+
+.lvt-panel .lvt-section {
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 8px;
+    margin-bottom: 6px;
+    overflow: hidden;
 }
+
+.lvt-panel .lvt-section-header {
+    padding: 9px 10px;
+    background-color: rgba(255, 255, 255, 0.03);
+}
+
+.lvt-panel .lvt-section-title {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+
+.lvt-panel .lvt-section-title > i {
+    opacity: 0.55;
+    width: 1em;
+    text-align: center;
+}
+
+.lvt-panel .lvt-section-title > span {
+    font-weight: bold;
+}
+
+/* One-line reminder of what lives in each section, so the collapsed panel is
+   still navigable without opening everything. */
+.lvt-panel .lvt-section-sub {
+    opacity: 0.5;
+    font-size: 0.82em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.lvt-panel .lvt-section-body {
+    padding: 4px 10px 10px;
+}
+
+/* --- Nested sub-sections for the advanced knobs ------------------------- */
+
+.lvt-panel .lvt-subsection {
+    border-top: 1px solid var(--SmartThemeBorderColor, #444);
+    margin-top: 8px;
+}
+
+.lvt-panel .lvt-subsection-header {
+    padding: 7px 0;
+    font-size: 0.9em;
+    opacity: 0.8;
+}
+
+.lvt-panel .lvt-subsection .inline-drawer-content {
+    padding-bottom: 4px;
+}
+
+/* --- Headings inside a section ------------------------------------------ */
+
+.lvt-panel .lvt-subhead {
+    font-weight: bold;
+    opacity: 0.75;
+    margin: 12px 0 5px;
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.lvt-panel .lvt-subhead-danger {
+    color: var(--crimson70a, #d9737f);
+    opacity: 0.85;
+}
+
+/* --- Fields -------------------------------------------------------------- */
+
+.lvt-panel .lvt-field {
+    margin-bottom: 8px;
+}
+
+.lvt-panel label {
+    display: block;
+    font-size: 0.88em;
+    opacity: 0.85;
+    margin-bottom: 3px;
+}
+
+.lvt-panel label.checkbox_label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    opacity: 1;
+    margin: 4px 0;
+    min-height: 28px;
+}
+
+.lvt-panel input.text_pole,
+.lvt-panel select.text_pole {
+    width: 100%;
+}
+
+/* Two fields per row where they're naturally paired (depth/role,
+   order/step) — halves the scrolling without cramping either one. */
+.lvt-panel .lvt-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+/* Checkboxes are short enough to sit two-up even on a narrow phone. */
+.lvt-panel .lvt-checkgrid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 10px;
+    margin: 4px 0;
+}
+
+/* --- Explanatory text ---------------------------------------------------- */
+
+.lvt-panel .lvt-hint {
+    opacity: 0.6;
+    font-size: 0.82em;
+    line-height: 1.4;
+    margin: 4px 0 8px;
+}
+
+.lvt-panel .lvt-hint b {
+    opacity: 0.9;
+}
+
+.lvt-panel .lvt-note {
+    display: block;
+    opacity: 0.65;
+    line-height: 1.35;
+}
+
+/* --- Buttons ------------------------------------------------------------- */
 
 .lvt-panel .lvt-buttons {
     display: flex;
     flex-direction: column;
     gap: 5px;
-    margin-bottom: 6px;
+    margin: 6px 0;
 }
 
 /* Full-width stacked buttons are far easier to hit on a phone
@@ -33,66 +176,57 @@
     min-height: 36px;
 }
 
-/* The grouping form is the only part of the panel with free-text inputs;
-   they want the full width and a little air under each label. */
-.lvt-panel > .inline-drawer > .inline-drawer-content > label {
-    display: block;
-    font-size: 0.9em;
-    opacity: 0.8;
-    margin: 6px 0 2px;
-}
-
-.lvt-panel > .inline-drawer > .inline-drawer-content > label.checkbox_label {
-    display: flex;
-    margin: 2px 0;
-    opacity: 1;
-}
-
-.lvt-panel input.text_pole,
-.lvt-panel select.text_pole {
-    width: 100%;
-    margin-bottom: 4px;
+/* The action you actually came to the section for. */
+.lvt-panel .lvt-primary {
+    border-color: var(--SmartThemeQuoteColor, #6c8cd5);
 }
 
 .lvt-panel .lvt-danger {
     border-color: var(--crimson70a, #b3404a);
+    opacity: 0.9;
 }
+
+/* --- Status -------------------------------------------------------------- */
 
 .lvt-panel .lvt-status {
     min-height: 1.2em;
-    margin: 6px 0;
-    font-size: 0.9em;
+    margin-top: 6px;
+    font-size: 0.85em;
     word-break: break-word;
+    opacity: 0.75;
+}
+
+.lvt-panel .lvt-status:empty {
+    display: none;
 }
 
 .lvt-panel .lvt-status.lvt_ok {
     color: var(--greenpalegold, #7bc47b);
+    opacity: 1;
 }
 
 .lvt-panel .lvt-status.lvt_err {
     color: var(--crimson70a, #d9737f);
+    opacity: 1;
 }
 
 .lvt-panel .lvt-status.lvt_busy {
     opacity: 0.6;
 }
 
-.lvt-panel .lvt-note {
-    display: block;
-    opacity: 0.65;
-    line-height: 1.35;
-}
+/* --- Lists (activation log, previews, trace) ----------------------------- */
 
 .lvt-panel .lvt-log {
     max-height: 45vh;
     overflow-y: auto;
     border: 1px solid var(--SmartThemeBorderColor, #444);
     border-radius: 6px;
-    padding: 6px;
+    padding: 6px 8px;
     font-size: 0.85em;
+    background-color: rgba(0, 0, 0, 0.12);
 }
 
-/* Preview lists sit above the buttons you are about to press, so they get a
+/* Previews sit above the buttons you're about to press, so they get a
    shorter cap than the activation log to keep the controls on screen. */
 .lvt-panel .lvt-preview {
     max-height: 30vh;
@@ -120,9 +254,13 @@
     display: flex;
     align-items: baseline;
     gap: 6px;
-    padding: 5px 0;
+    padding: 6px 0;
     cursor: pointer;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.lvt-panel .lvt-log-row:last-child {
+    border-bottom: none;
 }
 
 /* Tapped open: full text, wrapped, world name on its own line. */
@@ -190,4 +328,12 @@
 
 .lvt-panel .lvt-detail-dim {
     opacity: 0.6;
+}
+
+/* Sits inside an expanded log row, so it needs to look like a control rather
+   than another line of detail text. */
+.lvt-panel .lvt-measure {
+    margin: 6px 0 2px;
+    min-height: 30px;
+    font-size: 0.85em;
 }
