@@ -1055,24 +1055,30 @@ function targetGroupsFor(match, options, slot) {
     return base.map(name => `${name}-${(slot % allowed) + 1}`);
 }
 
+const GROUP_FIELDS = ['group', 'groupOverride', 'groupWeight', 'useGroupScoring'];
+const PLACEMENT_FIELDS = ['position', 'role', 'depth', 'order'];
+
 /**
- * Stashes the group fields of the entries about to change, so one wrong word
- * in the box isn't a manual repair job across 60 entries.
+ * Stashes the named fields of the entries about to change, so one wrong word
+ * in the box isn't a manual repair job across 60 entries. One slot per book,
+ * shared by grouping and placement — the label says which it was.
  * @param {string} bookName
  * @param {object[]} entries
+ * @param {string[]} fields
  * @param {string} label
  */
-function snapshotGroups(bookName, entries, label) {
+function snapshotFields(bookName, entries, fields, label) {
     const settings = getSettings();
     const snapshot = { label, savedAt: new Date().toISOString(), entries: {} };
 
     for (const entry of entries.slice(0, MAX_UNDO_ENTRIES)) {
-        snapshot.entries[String(entry.uid)] = {
-            group: entry.group ?? '',
-            groupOverride: entry.groupOverride ?? false,
-            groupWeight: entry.groupWeight ?? DEFAULT_GROUP_WEIGHT,
-            useGroupScoring: entry.useGroupScoring ?? null,
-        };
+        const saved = {};
+
+        for (const field of fields) {
+            saved[field] = entry[field] ?? FIELD_DEFAULTS[field] ?? null;
+        }
+
+        snapshot.entries[String(entry.uid)] = saved;
     }
 
     settings.groupUndo[bookName] = snapshot;
@@ -1080,34 +1086,47 @@ function snapshotGroups(bookName, entries, label) {
 }
 
 /**
+ * Falling back to the same defaults world-info.js uses, so "is this actually
+ * different?" gives the same answer the editor would.
+ */
+const FIELD_DEFAULTS = {
+    group: '',
+    groupOverride: false,
+    groupWeight: DEFAULT_GROUP_WEIGHT,
+    useGroupScoring: null,
+    position: 0,
+    role: 0,
+    depth: 4,
+    order: 100,
+};
+
+/**
+ * Writes entry fields and mirrors them into original data, skipping no-ops.
  * @param {object} data
  * @param {object} entry
  * @param {object} fields
+ * @returns {boolean} Whether anything actually changed.
  */
-function writeGroupFields(data, entry, fields) {
+function writeEntryFields(data, entry, fields) {
     let changed = false;
 
-    if ('group' in fields && (entry.group ?? '') !== fields.group) {
-        entry.group = fields.group;
-        setWIOriginalDataValue(data, entry.uid, GROUP_ORIGINAL_KEY, fields.group);
-        changed = true;
-    }
+    for (const [key, value] of Object.entries(fields)) {
+        const current = entry[key] ?? FIELD_DEFAULTS[key] ?? null;
 
-    if ('groupOverride' in fields && (entry.groupOverride ?? false) !== fields.groupOverride) {
-        entry.groupOverride = fields.groupOverride;
-        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.groupOverride, fields.groupOverride);
-        changed = true;
-    }
+        if (current === value) {
+            continue;
+        }
 
-    if ('groupWeight' in fields && (entry.groupWeight ?? DEFAULT_GROUP_WEIGHT) !== fields.groupWeight) {
-        entry.groupWeight = fields.groupWeight;
-        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.groupWeight, fields.groupWeight);
-        changed = true;
-    }
+        entry[key] = value;
 
-    if ('useGroupScoring' in fields && (entry.useGroupScoring ?? null) !== fields.useGroupScoring) {
-        entry.useGroupScoring = fields.useGroupScoring;
-        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.useGroupScoring, fields.useGroupScoring);
+        // `group` is the one field missing from originalWIDataKeyMap; its path
+        // is written literally, exactly as the entry editor does.
+        const path = key === 'group' ? GROUP_ORIGINAL_KEY : originalWIDataKeyMap[key];
+
+        if (path) {
+            setWIOriginalDataValue(data, entry.uid, path, value);
+        }
+
         changed = true;
     }
 
@@ -1148,7 +1167,7 @@ async function applyGrouping(bookName, options) {
         throw new Error('Nothing matched — no entries were changed.');
     }
 
-    snapshotGroups(bookName, matches.map(x => x.entry), options.mode === 'clear'
+    snapshotFields(bookName, matches.map(x => x.entry), GROUP_FIELDS, options.mode === 'clear'
         ? `before ungrouping "${options.terms.join(', ')}"`
         : `before grouping "${options.terms.join(', ')}"`);
 
@@ -1161,7 +1180,7 @@ async function applyGrouping(bookName, options) {
         const existing = parseGroups(entry.group);
 
         if (options.mode === 'clear') {
-            if (writeGroupFields(data, entry, {
+            if (writeEntryFields(data, entry, {
                 group: '',
                 groupOverride: false,
                 groupWeight: DEFAULT_GROUP_WEIGHT,
@@ -1190,7 +1209,7 @@ async function applyGrouping(bookName, options) {
             fields.useGroupScoring = options.scoring;
         }
 
-        if (writeGroupFields(data, entry, fields)) {
+        if (writeEntryFields(data, entry, fields)) {
             changed++;
         }
 
@@ -1212,15 +1231,15 @@ async function applyGrouping(bookName, options) {
 }
 
 /**
- * Puts the group fields back the way they were before the last bulk change.
+ * Puts the fields back the way they were before the last bulk change.
  * @param {string} bookName
- * @returns {Promise<number>}
+ * @returns {Promise<{restored: number, label: string}>}
  */
-async function undoGrouping(bookName) {
+async function undoBulkChange(bookName) {
     const snapshot = getSettings().groupUndo[bookName];
 
     if (!snapshot || !snapshot.entries) {
-        throw new Error(`No grouping change to undo for "${bookName}".`);
+        throw new Error(`No bulk change to undo for "${bookName}".`);
     }
 
     const data = await loadWorldInfo(bookName);
@@ -1238,7 +1257,7 @@ async function undoGrouping(bookName) {
             continue;
         }
 
-        if (writeGroupFields(data, entry, saved)) {
+        if (writeEntryFields(data, entry, saved)) {
             restored++;
         }
     }
@@ -1251,7 +1270,181 @@ async function undoGrouping(bookName) {
     delete getSettings().groupUndo[bookName];
     saveSettingsDebounced();
 
-    return restored;
+    return { restored, label: snapshot.label ?? 'last change' };
+}
+
+// ---------------------------------------------------------------------------
+// Bulk placement
+//
+// Position, depth, role and insertion order, applied across a whole book or a
+// filtered slice of it. Depth and role only mean anything at position @Depth,
+// so they are only written when that is where the entries are heading.
+// ---------------------------------------------------------------------------
+
+/** Mirrors world_info_position in world-info.js. */
+const WI_POSITION = {
+    before: 0,
+    after: 1,
+    ANTop: 2,
+    ANBottom: 3,
+    atDepth: 4,
+    EMTop: 5,
+    EMBottom: 6,
+};
+
+const POSITION_LABELS = {
+    0: '↑Char',
+    1: '↓Char',
+    2: '↑AN',
+    3: '↓AN',
+    4: '@Depth',
+    5: '↑EM',
+    6: '↓EM',
+    7: 'Outlet',
+};
+
+/**
+ * @param {object} entry
+ * @param {string} filter
+ * @returns {boolean}
+ */
+function matchesPlacementFilter(entry, filter) {
+    switch (filter) {
+        case 'vectorized': return !!entry.vectorized;
+        case 'notVectorized': return !entry.vectorized && !entry.constant;
+        case 'constant': return !!entry.constant;
+        case 'grouped': return parseGroups(entry.group).length > 0;
+        default: return true;
+    }
+}
+
+/**
+ * @param {string} bookName
+ * @param {object} options
+ * @returns {Promise<{entry: object}[]>}
+ */
+async function findPlacementTargets(bookName, options) {
+    const data = await loadWorldInfo(bookName);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${bookName}"`);
+    }
+
+    let entries = Object.values(data.entries);
+
+    if (options.skipDisabled) {
+        entries = entries.filter(x => !x.disable);
+    }
+
+    entries = entries.filter(x => matchesPlacementFilter(x, options.filter));
+
+    // "Matching the words above" reuses the grouping search box, so one set of
+    // words can drive both sections without retyping.
+    if (options.filter === 'matching') {
+        const matched = new Set(findGroupMatches(data, options).map(x => x.entry.uid));
+        entries = entries.filter(x => matched.has(x.uid));
+    }
+
+    // Insertion order is only meaningful relative to other entries, so
+    // sequential numbering follows the book's own display order.
+    entries.sort((a, b) => (a.displayIndex ?? a.uid) - (b.displayIndex ?? b.uid));
+
+    return { data, entries };
+}
+
+/**
+ * @param {string} bookName
+ * @param {object} options
+ * @returns {Promise<{matched: number, changed: number}>}
+ */
+async function applyPlacement(bookName, options) {
+    const { data, entries } = await findPlacementTargets(bookName, options);
+
+    if (entries.length === 0) {
+        throw new Error('Nothing matched — no entries were changed.');
+    }
+
+    if (!options.setPosition && !options.setDepth && !options.setOrder) {
+        throw new Error('Tick at least one of position, depth or insertion order.');
+    }
+
+    snapshotFields(bookName, entries, PLACEMENT_FIELDS, `before placement change (${entries.length} entries)`);
+
+    let changed = 0;
+    let step = 0;
+
+    for (const entry of entries) {
+        const fields = {};
+        const position = options.setPosition ? options.position : (entry.position ?? 0);
+
+        if (options.setPosition) {
+            fields.position = options.position;
+        }
+
+        // Depth and role are @Depth-only in the editor; writing them elsewhere
+        // would show values the entry never uses.
+        if (position === WI_POSITION.atDepth) {
+            if (options.setDepth) {
+                fields.depth = options.depth;
+            }
+
+            if (options.setPosition) {
+                fields.role = options.role;
+            }
+        }
+
+        if (options.setOrder) {
+            fields.order = options.order + (options.orderStep * step);
+        }
+
+        if (writeEntryFields(data, entry, fields)) {
+            changed++;
+        }
+
+        step++;
+    }
+
+    if (changed > 0) {
+        await saveWorldInfo(bookName, data, true);
+        reloadEditor(bookName);
+    }
+
+    return { matched: entries.length, changed };
+}
+
+/**
+ * Current placement spread, so you can see what a book looks like before
+ * changing it and confirm afterwards.
+ * @param {string} bookName
+ * @param {object} options
+ * @returns {Promise<{matched: number, rows: {left: string, text: string, right: string}[]}>}
+ */
+async function summarisePlacement(bookName, options) {
+    const { entries } = await findPlacementTargets(bookName, options);
+    const counts = new Map();
+
+    for (const entry of entries) {
+        const position = entry.position ?? 0;
+        const label = position === WI_POSITION.atDepth
+            ? `@Depth ${entry.depth ?? FIELD_DEFAULTS.depth} (${['system', 'user', 'assistant'][entry.role ?? 0] ?? 'system'})`
+            : POSITION_LABELS[position] ?? `position ${position}`;
+        counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+
+    const orders = entries.map(x => x.order ?? FIELD_DEFAULTS.order);
+    const rows = [...counts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([label, count]) => ({ left: '▤', text: label, right: String(count) }));
+
+    if (orders.length > 0) {
+        rows.push({
+            left: '#',
+            text: `insertion order ${Math.min(...orders)} – ${Math.max(...orders)}`,
+            right: `${new Set(orders).size} distinct`,
+        });
+    }
+
+    return { matched: entries.length, rows };
 }
 
 /**
@@ -1472,12 +1665,55 @@ function readGroupOptions() {
 }
 
 /**
+ * Reads the placement form. The word/scope boxes are shared with the grouping
+ * section, so "entries matching the words above" needs no second search box.
+ * @returns {object}
+ */
+function readPlacementOptions() {
+    const number = (selector, fallback) => {
+        const value = Number($(selector).val());
+        return Number.isFinite(value) ? Math.round(value) : fallback;
+    };
+
+    const group = readGroupOptions();
+
+    return {
+        ...group,
+        filter: String($('#lvt_place_filter').val() ?? 'all'),
+        skipDisabled: $('#lvt_place_skip_disabled').prop('checked'),
+        setPosition: $('#lvt_place_set_position').prop('checked'),
+        position: number('#lvt_place_position', WI_POSITION.atDepth),
+        role: number('#lvt_place_role', 0),
+        setDepth: $('#lvt_place_set_depth').prop('checked'),
+        depth: Math.max(0, number('#lvt_place_depth', FIELD_DEFAULTS.depth)),
+        setOrder: $('#lvt_place_set_order').prop('checked'),
+        order: Math.max(0, number('#lvt_place_order', FIELD_DEFAULTS.order)),
+        orderStep: number('#lvt_place_order_step', 0),
+    };
+}
+
+/**
+ * @param {string} head
+ * @param {{left: string, text: string, right: string}[]} rows
+ */
+function renderPlacementResults(head, rows) {
+    renderResultList($('#lvt_place_results'), head, rows);
+}
+
+/**
  * @param {string} head
  * @param {{left: string, text: string, right: string}[]} rows
  */
 function renderGroupResults(head, rows) {
-    const container = $('#lvt_group_results');
+    renderResultList($('#lvt_group_results'), head, rows);
+}
 
+/**
+ * @param {JQuery} container
+ * @param {string} head
+ * @param {{left: string, text: string, right: string}[]} rows
+ */
+function renderResultList(container, head, rows) {
     if (container.length === 0) {
         return;
     }
@@ -1607,6 +1843,67 @@ function addSettingsPanel() {
                     through, raise "let this many through" and the matches are split
                     into that many numbered pools, one winner each. Weight decides
                     the odds within a pool; prioritize overrides them.
+                </small>
+
+                <div class="lvt-section-label">Bulk placement</div>
+                <label for="lvt_place_filter">Apply to</label>
+                <select id="lvt_place_filter" class="text_pole">
+                    <option value="all">Every entry in this lorebook</option>
+                    <option value="vectorized">Vectorized entries only</option>
+                    <option value="notVectorized">Keyword-only entries</option>
+                    <option value="constant">Constant entries only</option>
+                    <option value="grouped">Grouped entries only</option>
+                    <option value="matching">Entries matching the words above</option>
+                </select>
+                <label class="checkbox_label" for="lvt_place_skip_disabled">
+                    <input id="lvt_place_skip_disabled" type="checkbox" checked>
+                    <span>Skip disabled entries</span>
+                </label>
+
+                <label class="checkbox_label" for="lvt_place_set_position">
+                    <input id="lvt_place_set_position" type="checkbox" checked>
+                    <span>Set position</span>
+                </label>
+                <select id="lvt_place_position" class="text_pole">
+                    <option value="0">↑Char — before character definitions</option>
+                    <option value="1">↓Char — after character definitions</option>
+                    <option value="2">↑AN — before author's note</option>
+                    <option value="3">↓AN — after author's note</option>
+                    <option value="4" selected>@Depth — in the chat at a depth</option>
+                    <option value="5">↑EM — before example messages</option>
+                    <option value="6">↓EM — after example messages</option>
+                </select>
+                <label for="lvt_place_role">Role (@Depth only)</label>
+                <select id="lvt_place_role" class="text_pole">
+                    <option value="0">System</option>
+                    <option value="1">User</option>
+                    <option value="2">Assistant</option>
+                </select>
+
+                <label class="checkbox_label" for="lvt_place_set_depth">
+                    <input id="lvt_place_set_depth" type="checkbox" checked>
+                    <span>Set depth (@Depth only)</span>
+                </label>
+                <input id="lvt_place_depth" class="text_pole" type="number" min="0" max="9999" step="1" value="4">
+
+                <label class="checkbox_label" for="lvt_place_set_order">
+                    <input id="lvt_place_set_order" type="checkbox">
+                    <span>Set insertion order</span>
+                </label>
+                <input id="lvt_place_order" class="text_pole" type="number" min="0" max="99999" step="1" value="100">
+                <label for="lvt_place_order_step">Step per entry (0 = same order for all)</label>
+                <input id="lvt_place_order_step" class="text_pole" type="number" min="-100" max="100" step="1" value="0">
+
+                <div class="lvt-buttons">
+                    <button id="lvt_place_summary" class="menu_button">Show current placement</button>
+                    <button id="lvt_place_apply" class="menu_button">Apply placement</button>
+                    <button id="lvt_place_undo" class="menu_button">Undo last bulk change</button>
+                </div>
+                <div id="lvt_place_results" class="lvt-log lvt-preview"></div>
+                <small class="lvt-note">
+                    Depth and role only apply at @Depth — a higher depth number sits
+                    further back in the chat. Insertion order breaks ties between
+                    entries in the same place: lower goes in first.
                 </small>
 
                 <div class="lvt-section-label">Saved keyword sets</div>
@@ -1789,13 +2086,35 @@ function addSettingsPanel() {
         },
     }));
 
-    $('#lvt_group_undo').on('click', () => runAction({
-        confirmHeader: 'Undo last grouping change?',
-        confirmText: 'Restores the group, priority, weight and scoring fields as they were before the last bulk change in this lorebook.',
+    $('#lvt_group_undo, #lvt_place_undo').on('click', () => runAction({
+        confirmHeader: 'Undo last bulk change?',
+        confirmText: 'Restores the fields touched by the last grouping or placement change in this lorebook.',
         run: async (book) => {
-            const n = await undoGrouping(book);
+            const { restored, label } = await undoBulkChange(book);
             renderGroupResults('Undone', []);
-            return `Restored group settings on ${n} entr${n === 1 ? 'y' : 'ies'}.`;
+            renderPlacementResults('Undone', []);
+            return `Restored ${restored} entr${restored === 1 ? 'y' : 'ies'} (${label}).`;
+        },
+    }));
+
+    $('#lvt_place_summary').on('click', () => runAction({
+        run: async (book) => {
+            const options = readPlacementOptions();
+            const { matched, rows } = await summarisePlacement(book, options);
+            renderPlacementResults(`${matched} entr${matched === 1 ? 'y' : 'ies'} selected`, rows);
+            return `${matched} entr${matched === 1 ? 'y' : 'ies'} selected. Nothing changed.`;
+        },
+    }));
+
+    $('#lvt_place_apply').on('click', () => runAction({
+        confirmHeader: 'Apply placement?',
+        confirmText: 'Rewrites position, depth and/or insertion order on every selected entry. Undoable.',
+        run: async (book) => {
+            const options = readPlacementOptions();
+            const { matched, changed } = await applyPlacement(book, options);
+            const { rows } = await summarisePlacement(book, options);
+            renderPlacementResults(`${matched} entr${matched === 1 ? 'y' : 'ies'} now`, rows);
+            return `Updated ${changed} of ${matched} selected entr${matched === 1 ? 'y' : 'ies'} in "${book}".`;
         },
     }));
 
@@ -1809,6 +2128,7 @@ function addSettingsPanel() {
     $('#lvt_book_select').on('change', () => {
         refreshBankList();
         $('#lvt_group_results').empty();
+        $('#lvt_place_results').empty();
         setStatus('');
     });
 
@@ -2068,6 +2388,76 @@ function registerCommands() {
         callback: async (_args, value) => {
             const groups = await listGroups(String(value));
             return groups.map(g => `${g.name}: ${g.count}`).join('\n');
+        },
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lvt-place',
+        helpString: 'Sets position / depth / role / insertion order in bulk. Example: /lvt-place pos=atDepth depth=4 role=system My Lorebook',
+        returns: 'number of entries changed',
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'pos',
+                description: 'before, after, ANTop, ANBottom, atDepth, EMTop, EMBottom',
+                typeList: [ARGUMENT_TYPE.STRING],
+                enumList: Object.keys(WI_POSITION).map(x => new SlashCommandEnumValue(x)),
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'depth',
+                description: 'chat depth, @Depth only',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'role',
+                description: 'system, user or assistant (@Depth only)',
+                typeList: [ARGUMENT_TYPE.STRING],
+                enumList: ['system', 'user', 'assistant'].map(x => new SlashCommandEnumValue(x)),
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'order',
+                description: 'insertion order',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'step',
+                description: 'add this much to the order per entry (default 0)',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'filter',
+                description: 'all (default), vectorized, notVectorized, constant, grouped',
+                typeList: [ARGUMENT_TYPE.STRING],
+                enumList: ['all', 'vectorized', 'notVectorized', 'constant', 'grouped'].map(x => new SlashCommandEnumValue(x)),
+            }),
+        ],
+        unnamedArgumentList: [bookArgument()],
+        callback: async (args, value) => {
+            const roles = { system: 0, user: 1, assistant: 2 };
+            const hasPos = args.pos !== undefined && args.pos !== '';
+            const hasDepth = args.depth !== undefined && args.depth !== '';
+            const hasOrder = args.order !== undefined && args.order !== '';
+            const position = WI_POSITION[String(args.pos)];
+
+            if (hasPos && position === undefined) {
+                throw new Error(`Unknown position "${args.pos}".`);
+            }
+
+            const { changed } = await applyPlacement(String(value), {
+                filter: String(args.filter ?? 'all'),
+                skipDisabled: true,
+                terms: [],
+                scope: { title: true, keys: true, content: true },
+                setPosition: hasPos,
+                position: position ?? WI_POSITION.atDepth,
+                role: roles[String(args.role ?? 'system')] ?? 0,
+                setDepth: hasDepth,
+                depth: Math.max(0, Math.round(Number(args.depth) || 0)),
+                setOrder: hasOrder,
+                order: Math.max(0, Math.round(Number(args.order) || 0)),
+                orderStep: Math.round(Number(args.step) || 0),
+            });
+
+            return String(changed);
         },
     }));
 
