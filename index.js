@@ -12,7 +12,7 @@ import { getStringHash } from '../../../utils.js';
 import { Popup, POPUP_RESULT } from '../../../popup.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
-import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { SlashCommandEnumValue } from '../../../slash-commands/SlashCommandEnumValue.js';
 import { textgen_types, textgenerationwebui_settings } from '../../../textgen-settings.js';
 import { oai_settings } from '../../../openai.js';
@@ -32,16 +32,20 @@ const CLIENT_SIDE_SOURCES = ['webllm', 'koboldcpp'];
 // first, falling back to a content hash so a re-imported book still restores.
 // ---------------------------------------------------------------------------
 
-/** @returns {{banks: Record<string, object[]>, autoBank: boolean}} */
+/** @returns {{banks: Record<string, object[]>, autoBank: boolean, groupUndo: Record<string, object>}} */
 function getSettings() {
     if (!extension_settings[SETTINGS_KEY]) {
-        extension_settings[SETTINGS_KEY] = { banks: {}, autoBank: true };
+        extension_settings[SETTINGS_KEY] = { banks: {}, autoBank: true, groupUndo: {} };
     }
 
     const settings = extension_settings[SETTINGS_KEY];
 
     if (!settings.banks || typeof settings.banks !== 'object') {
         settings.banks = {};
+    }
+
+    if (!settings.groupUndo || typeof settings.groupUndo !== 'object') {
+        settings.groupUndo = {};
     }
 
     if (typeof settings.autoBank !== 'boolean') {
@@ -896,6 +900,387 @@ async function clearBookKeywords(name, includeSecondary) {
     return changed;
 }
 
+// ---------------------------------------------------------------------------
+// Bulk inclusion grouping
+//
+// An inclusion group makes its members compete: however many of them match in
+// one turn, world-info inserts exactly one winner. That is the lever for "too
+// many entries are firing" — the entries keep their keywords, they just stop
+// stacking on top of each other.
+//
+// `group` is a comma-separated string, so an entry can sit in several groups.
+// It is the one group field missing from originalWIDataKeyMap, so its
+// original-data path is written literally, exactly as the entry editor does.
+// ---------------------------------------------------------------------------
+
+const GROUP_ORIGINAL_KEY = 'extensions.group';
+const DEFAULT_GROUP_WEIGHT = 100;
+/** Undo snapshots live in settings, so they get a sane ceiling. */
+const MAX_UNDO_ENTRIES = 2000;
+
+/**
+ * @param {string} text
+ * @returns {string[]}
+ */
+function splitTerms(text) {
+    return String(text ?? '').split(',').map(x => x.trim()).filter(Boolean);
+}
+
+/** @param {string} value @returns {string[]} */
+function parseGroups(value) {
+    return String(value ?? '').split(',').map(x => x.trim()).filter(Boolean);
+}
+
+/** @param {string[]} list @returns {string} */
+function formatGroups(list) {
+    return [...new Set(list)].join(', ');
+}
+
+/** @param {string} text @returns {string} */
+function escapeRegex(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * @param {string} term
+ * @param {{wholeWord: boolean, caseSensitive: boolean}} options
+ * @returns {(text: string) => boolean}
+ */
+function makeTermTester(term, { wholeWord, caseSensitive }) {
+    if (!wholeWord) {
+        const needle = caseSensitive ? term : term.toLowerCase();
+        return text => (caseSensitive ? text : text.toLowerCase()).includes(needle);
+    }
+
+    // Built without lookbehind — Safari only picked that up in 16.4, and this
+    // runs in whatever browser the phone happens to have.
+    const pattern = new RegExp(`(^|[^\\w])${escapeRegex(term)}(?![\\w])`, caseSensitive ? '' : 'i');
+    return text => pattern.test(text);
+}
+
+/**
+ * @param {object} entry
+ * @param {{title: boolean, keys: boolean, content: boolean}} scope
+ * @returns {string[]}
+ */
+function entryHaystacks(entry, scope) {
+    const parts = [];
+
+    if (scope.title) {
+        parts.push(String(entry.comment ?? ''));
+    }
+
+    if (scope.keys) {
+        const primary = Array.isArray(entry.key) ? entry.key : [];
+        const secondary = Array.isArray(entry.keysecondary) ? entry.keysecondary : [];
+        parts.push([...primary, ...secondary].join(' , '));
+    }
+
+    if (scope.content) {
+        parts.push(String(entry.content ?? ''));
+    }
+
+    return parts.filter(Boolean);
+}
+
+/**
+ * @param {object} data Loaded lorebook.
+ * @param {object} options
+ * @returns {{entry: object, terms: string[]}[]}
+ */
+function findGroupMatches(data, options) {
+    const { terms, scope } = options;
+
+    if (terms.length === 0) {
+        throw new Error('Enter at least one word to match on.');
+    }
+
+    if (!scope.title && !scope.keys && !scope.content) {
+        throw new Error('Pick at least one place to search: title, keywords or content.');
+    }
+
+    const testers = terms.map(term => ({ term, test: makeTermTester(term, options) }));
+    const matches = [];
+
+    for (const entry of Object.values(data.entries)) {
+        if (options.skipDisabled && entry.disable) {
+            continue;
+        }
+
+        const haystacks = entryHaystacks(entry, scope);
+
+        if (haystacks.length === 0) {
+            continue;
+        }
+
+        const hits = testers.filter(t => haystacks.some(h => t.test(h))).map(t => t.term);
+
+        if (hits.length > 0) {
+            matches.push({ entry, terms: hits });
+        }
+    }
+
+    return matches;
+}
+
+/**
+ * Which group name(s) a match should end up in. A blank group name means
+ * "name each group after the word that found it", which is the whole point of
+ * passing several words at once.
+ *
+ * ST allows exactly one winner per group, so "allow N through" is done by
+ * splitting the members across N numbered pools — dorm-1, dorm-2 — and letting
+ * each pool elect its own winner. Assignment is round-robin over the match
+ * order, so entries sitting next to each other in the book (usually the
+ * near-duplicates you are trying to thin out) land in different pools.
+ * @param {{terms: string[]}} match
+ * @param {object} options
+ * @param {number} slot Round-robin counter across applied entries.
+ * @returns {string[]}
+ */
+function targetGroupsFor(match, options, slot) {
+    const explicit = parseGroups(options.groupName);
+
+    // Replace can only mean one group, so the first word that hit wins.
+    const base = explicit.length > 0
+        ? explicit
+        : options.mode === 'append' ? [...match.terms] : [match.terms[0]];
+
+    const allowed = Number(options.allowPerGroup) || 1;
+
+    if (allowed <= 1) {
+        return base;
+    }
+
+    return base.map(name => `${name}-${(slot % allowed) + 1}`);
+}
+
+/**
+ * Stashes the group fields of the entries about to change, so one wrong word
+ * in the box isn't a manual repair job across 60 entries.
+ * @param {string} bookName
+ * @param {object[]} entries
+ * @param {string} label
+ */
+function snapshotGroups(bookName, entries, label) {
+    const settings = getSettings();
+    const snapshot = { label, savedAt: new Date().toISOString(), entries: {} };
+
+    for (const entry of entries.slice(0, MAX_UNDO_ENTRIES)) {
+        snapshot.entries[String(entry.uid)] = {
+            group: entry.group ?? '',
+            groupOverride: entry.groupOverride ?? false,
+            groupWeight: entry.groupWeight ?? DEFAULT_GROUP_WEIGHT,
+            useGroupScoring: entry.useGroupScoring ?? null,
+        };
+    }
+
+    settings.groupUndo[bookName] = snapshot;
+    saveSettingsDebounced();
+}
+
+/**
+ * @param {object} data
+ * @param {object} entry
+ * @param {object} fields
+ */
+function writeGroupFields(data, entry, fields) {
+    let changed = false;
+
+    if ('group' in fields && (entry.group ?? '') !== fields.group) {
+        entry.group = fields.group;
+        setWIOriginalDataValue(data, entry.uid, GROUP_ORIGINAL_KEY, fields.group);
+        changed = true;
+    }
+
+    if ('groupOverride' in fields && (entry.groupOverride ?? false) !== fields.groupOverride) {
+        entry.groupOverride = fields.groupOverride;
+        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.groupOverride, fields.groupOverride);
+        changed = true;
+    }
+
+    if ('groupWeight' in fields && (entry.groupWeight ?? DEFAULT_GROUP_WEIGHT) !== fields.groupWeight) {
+        entry.groupWeight = fields.groupWeight;
+        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.groupWeight, fields.groupWeight);
+        changed = true;
+    }
+
+    if ('useGroupScoring' in fields && (entry.useGroupScoring ?? null) !== fields.useGroupScoring) {
+        entry.useGroupScoring = fields.useGroupScoring;
+        setWIOriginalDataValue(data, entry.uid, originalWIDataKeyMap.useGroupScoring, fields.useGroupScoring);
+        changed = true;
+    }
+
+    return changed;
+}
+
+/**
+ * Finds matching entries without touching anything.
+ * @param {string} bookName
+ * @param {object} options
+ * @returns {Promise<{entry: object, terms: string[]}[]>}
+ */
+async function previewGrouping(bookName, options) {
+    const data = await loadWorldInfo(bookName);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${bookName}"`);
+    }
+
+    return findGroupMatches(data, options);
+}
+
+/**
+ * @param {string} bookName
+ * @param {object} options
+ * @returns {Promise<{matched: number, changed: number, groups: [string, number][]}>}
+ */
+async function applyGrouping(bookName, options) {
+    const data = await loadWorldInfo(bookName);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${bookName}"`);
+    }
+
+    const matches = findGroupMatches(data, options);
+
+    if (matches.length === 0) {
+        throw new Error('Nothing matched — no entries were changed.');
+    }
+
+    snapshotGroups(bookName, matches.map(x => x.entry), options.mode === 'clear'
+        ? `before ungrouping "${options.terms.join(', ')}"`
+        : `before grouping "${options.terms.join(', ')}"`);
+
+    const counts = new Map();
+    let changed = 0;
+    let slot = 0;
+
+    for (const match of matches) {
+        const entry = match.entry;
+        const existing = parseGroups(entry.group);
+
+        if (options.mode === 'clear') {
+            if (writeGroupFields(data, entry, {
+                group: '',
+                groupOverride: false,
+                groupWeight: DEFAULT_GROUP_WEIGHT,
+                useGroupScoring: null,
+            })) {
+                changed++;
+            }
+            continue;
+        }
+
+        // "Only ungrouped entries" leaves anything already assigned alone,
+        // which is what you want on a second pass over the same book.
+        if (options.mode === 'fill' && existing.length > 0) {
+            continue;
+        }
+
+        const targets = targetGroupsFor(match, options, slot);
+        slot++;
+        const next = options.mode === 'append' ? [...existing, ...targets] : targets;
+
+        const fields = { group: formatGroups(next) };
+
+        if (options.applySettings) {
+            fields.groupOverride = options.prioritize;
+            fields.groupWeight = options.weight;
+            fields.useGroupScoring = options.scoring;
+        }
+
+        if (writeGroupFields(data, entry, fields)) {
+            changed++;
+        }
+
+        for (const name of targets) {
+            counts.set(name, (counts.get(name) ?? 0) + 1);
+        }
+    }
+
+    if (changed > 0) {
+        await saveWorldInfo(bookName, data, true);
+        reloadEditor(bookName);
+    }
+
+    return {
+        matched: matches.length,
+        changed,
+        groups: [...counts.entries()].sort((a, b) => b[1] - a[1]),
+    };
+}
+
+/**
+ * Puts the group fields back the way they were before the last bulk change.
+ * @param {string} bookName
+ * @returns {Promise<number>}
+ */
+async function undoGrouping(bookName) {
+    const snapshot = getSettings().groupUndo[bookName];
+
+    if (!snapshot || !snapshot.entries) {
+        throw new Error(`No grouping change to undo for "${bookName}".`);
+    }
+
+    const data = await loadWorldInfo(bookName);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${bookName}"`);
+    }
+
+    let restored = 0;
+
+    for (const [uid, saved] of Object.entries(snapshot.entries)) {
+        const entry = data.entries[uid];
+
+        if (!entry) {
+            continue;
+        }
+
+        if (writeGroupFields(data, entry, saved)) {
+            restored++;
+        }
+    }
+
+    if (restored > 0) {
+        await saveWorldInfo(bookName, data, true);
+        reloadEditor(bookName);
+    }
+
+    delete getSettings().groupUndo[bookName];
+    saveSettingsDebounced();
+
+    return restored;
+}
+
+/**
+ * @param {string} bookName
+ * @returns {Promise<{name: string, count: number, prioritized: number}[]>}
+ */
+async function listGroups(bookName) {
+    const data = await loadWorldInfo(bookName);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${bookName}"`);
+    }
+
+    const map = new Map();
+
+    for (const entry of Object.values(data.entries)) {
+        for (const name of parseGroups(entry.group)) {
+            const row = map.get(name) ?? { name, count: 0, prioritized: 0 };
+            row.count++;
+            if (entry.groupOverride) {
+                row.prioritized++;
+            }
+            map.set(name, row);
+        }
+    }
+
+    return [...map.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
 /**
  * Pushes embeddings for one lorebook into its vector collection immediately,
  * instead of waiting for the next generation to trigger a lazy sync.
@@ -1057,6 +1442,65 @@ async function runAction({ confirmHeader, confirmText, run }) {
     }
 }
 
+/**
+ * Reads the grouping form into the shape applyGrouping/previewGrouping want.
+ * @returns {object}
+ */
+function readGroupOptions() {
+    const scoring = String($('#lvt_group_scoring').val() ?? 'default');
+    const weight = Number($('#lvt_group_weight').val());
+    const allow = Number($('#lvt_group_allow').val());
+
+    return {
+        terms: splitTerms($('#lvt_group_terms').val()),
+        groupName: String($('#lvt_group_name').val() ?? '').trim(),
+        mode: String($('#lvt_group_mode').val() ?? 'replace'),
+        allowPerGroup: Number.isFinite(allow) && allow > 0 ? Math.round(allow) : 1,
+        scope: {
+            title: $('#lvt_group_in_title').prop('checked'),
+            keys: $('#lvt_group_in_keys').prop('checked'),
+            content: $('#lvt_group_in_content').prop('checked'),
+        },
+        wholeWord: $('#lvt_group_whole_word').prop('checked'),
+        caseSensitive: $('#lvt_group_case').prop('checked'),
+        skipDisabled: $('#lvt_group_skip_disabled').prop('checked'),
+        applySettings: $('#lvt_group_apply_settings').prop('checked'),
+        prioritize: $('#lvt_group_prioritize').prop('checked'),
+        weight: Number.isFinite(weight) && weight > 0 ? Math.round(weight) : DEFAULT_GROUP_WEIGHT,
+        scoring: scoring === 'on' ? true : scoring === 'off' ? false : null,
+    };
+}
+
+/**
+ * @param {string} head
+ * @param {{left: string, text: string, right: string}[]} rows
+ */
+function renderGroupResults(head, rows) {
+    const container = $('#lvt_group_results');
+
+    if (container.length === 0) {
+        return;
+    }
+
+    container.empty();
+    container.append($('<div class="lvt-log-head"></div>').text(head));
+
+    for (const row of rows) {
+        const line = $('<div class="lvt-log-row"></div>');
+        line.append($('<span class="lvt-log-badge"></span>').text(row.left));
+        line.append($('<span class="lvt-log-name"></span>').text(row.text));
+        line.append($('<span class="lvt-log-world"></span>').text(row.right));
+
+        // Same tap-to-expand behaviour as the activation log: titles get long
+        // and there is no hover on a phone.
+        line.on('click', function () {
+            $(this).toggleClass('lvt-expanded');
+        });
+
+        container.append(line);
+    }
+}
+
 function addSettingsPanel() {
     const html = `
     <div id="lvt_panel" class="lvt-panel">
@@ -1093,6 +1537,77 @@ function addSettingsPanel() {
                 <div class="lvt-buttons">
                     <button id="lvt_clear_keys" class="menu_button lvt-danger">Clear all keywords in this lorebook</button>
                 </div>
+
+                <div class="lvt-section-label">Bulk grouping</div>
+                <label for="lvt_group_terms">Words to match (comma-separated)</label>
+                <input id="lvt_group_terms" class="text_pole" type="text" placeholder="e.g. dorm, cafeteria, infirmary">
+                <label for="lvt_group_name">Group name</label>
+                <input id="lvt_group_name" class="text_pole" type="text" placeholder="blank = one group per matched word">
+                <label for="lvt_group_allow">Let this many through per turn</label>
+                <input id="lvt_group_allow" class="text_pole" type="number" min="1" max="20" step="1" value="1">
+                <label for="lvt_group_mode">If an entry is already grouped</label>
+                <select id="lvt_group_mode" class="text_pole">
+                    <option value="replace">Replace its groups</option>
+                    <option value="append">Add this group alongside</option>
+                    <option value="fill">Leave it alone (only group ungrouped entries)</option>
+                </select>
+                <div class="lvt-section-label">Look in</div>
+                <label class="checkbox_label" for="lvt_group_in_title">
+                    <input id="lvt_group_in_title" type="checkbox" checked>
+                    <span>Title / memo</span>
+                </label>
+                <label class="checkbox_label" for="lvt_group_in_keys">
+                    <input id="lvt_group_in_keys" type="checkbox" checked>
+                    <span>Keywords</span>
+                </label>
+                <label class="checkbox_label" for="lvt_group_in_content">
+                    <input id="lvt_group_in_content" type="checkbox" checked>
+                    <span>Content</span>
+                </label>
+                <label class="checkbox_label" for="lvt_group_whole_word">
+                    <input id="lvt_group_whole_word" type="checkbox" checked>
+                    <span>Whole words only</span>
+                </label>
+                <label class="checkbox_label" for="lvt_group_case">
+                    <input id="lvt_group_case" type="checkbox">
+                    <span>Case sensitive</span>
+                </label>
+                <label class="checkbox_label" for="lvt_group_skip_disabled">
+                    <input id="lvt_group_skip_disabled" type="checkbox" checked>
+                    <span>Skip disabled entries</span>
+                </label>
+                <div class="lvt-section-label">Group settings to apply</div>
+                <label class="checkbox_label" for="lvt_group_apply_settings">
+                    <input id="lvt_group_apply_settings" type="checkbox" checked>
+                    <span>Also set priority / weight / scoring below</span>
+                </label>
+                <label class="checkbox_label" for="lvt_group_prioritize">
+                    <input id="lvt_group_prioritize" type="checkbox">
+                    <span>Prioritize (this entry wins its group)</span>
+                </label>
+                <label for="lvt_group_weight">Group weight</label>
+                <input id="lvt_group_weight" class="text_pole" type="number" min="1" max="10000" step="1" value="100">
+                <label for="lvt_group_scoring">Group scoring</label>
+                <select id="lvt_group_scoring" class="text_pole">
+                    <option value="default">Use global setting</option>
+                    <option value="on">On — most keyword hits wins</option>
+                    <option value="off">Off</option>
+                </select>
+                <div class="lvt-buttons">
+                    <button id="lvt_group_preview" class="menu_button">Preview matches</button>
+                    <button id="lvt_group_apply" class="menu_button">Group matching entries</button>
+                    <button id="lvt_group_list" class="menu_button">List groups in this lorebook</button>
+                    <button id="lvt_group_undo" class="menu_button">Undo last grouping change</button>
+                    <button id="lvt_group_clear" class="menu_button lvt-danger">Ungroup matching entries</button>
+                </div>
+                <div id="lvt_group_results" class="lvt-log lvt-preview"></div>
+                <small class="lvt-note">
+                    Grouped entries still activate as normal — SillyTavern inserts
+                    exactly one member per group per turn. To let more than one
+                    through, raise "let this many through" and the matches are split
+                    into that many numbered pools, one winner each. Weight decides
+                    the odds within a pool; prioritize overrides them.
+                </small>
 
                 <div class="lvt-section-label">Saved keyword sets</div>
                 <div class="lvt-row">
@@ -1204,6 +1719,86 @@ function addSettingsPanel() {
         },
     }));
 
+    $('#lvt_group_preview').on('click', () => runAction({
+        run: async (book) => {
+            const options = readGroupOptions();
+            const matches = await previewGrouping(book, options);
+            // Mirror the apply loop's slot accounting: "fill" skips entries that
+            // already have a group, and skipped entries must not advance the
+            // round-robin, or the preview would show the wrong pool.
+            let slot = 0;
+            const rows = matches.map((m) => {
+                const skipped = options.mode === 'fill' && parseGroups(m.entry.group).length > 0;
+                return {
+                    left: skipped ? '–' : '·',
+                    text: entryLabel(m.entry),
+                    right: skipped ? 'left as is' : targetGroupsFor(m, options, slot++).join(' + '),
+                };
+            });
+            renderGroupResults(
+                `${matches.length} entr${matches.length === 1 ? 'y' : 'ies'} match`,
+                rows,
+            );
+            const pools = options.allowPerGroup > 1
+                ? ` Split across ${options.allowPerGroup} pools, so ${options.allowPerGroup} can fire per turn.`
+                : '';
+            return `${matches.length} entr${matches.length === 1 ? 'y' : 'ies'} would be grouped.${pools} Nothing changed yet.`;
+        },
+    }));
+
+    $('#lvt_group_apply').on('click', () => runAction({
+        confirmHeader: 'Group matching entries?',
+        confirmText: 'Writes the group field on every matching entry in this lorebook. The previous groups are stashed, so "Undo last grouping change" will put them back.',
+        run: async (book) => {
+            const options = readGroupOptions();
+            const { matched, changed, groups } = await applyGrouping(book, options);
+            renderGroupResults(
+                `${changed} of ${matched} matching entries changed`,
+                groups.map(([name, count]) => ({ left: '▣', text: name, right: `${count}` })),
+            );
+            const tail = groups.length > 1 ? ` across ${groups.length} groups` : '';
+            return `Grouped ${changed} of ${matched} matching entr${matched === 1 ? 'y' : 'ies'}${tail}.`;
+        },
+    }));
+
+    $('#lvt_group_clear').on('click', () => runAction({
+        confirmHeader: 'Ungroup matching entries?',
+        confirmText: 'Empties the group field and resets priority, weight and scoring on every matching entry. Undoable.',
+        run: async (book) => {
+            const options = { ...readGroupOptions(), mode: 'clear' };
+            const { matched, changed } = await applyGrouping(book, options);
+            renderGroupResults(`${changed} of ${matched} matching entries ungrouped`, []);
+            return `Ungrouped ${changed} entr${changed === 1 ? 'y' : 'ies'} in "${book}".`;
+        },
+    }));
+
+    $('#lvt_group_list').on('click', () => runAction({
+        run: async (book) => {
+            const groups = await listGroups(book);
+            renderGroupResults(
+                groups.length === 0 ? 'No inclusion groups in this lorebook' : `${groups.length} group${groups.length === 1 ? '' : 's'}`,
+                groups.map(g => ({
+                    left: '▣',
+                    text: g.name,
+                    right: g.prioritized > 0 ? `${g.count} · ${g.prioritized}★` : `${g.count}`,
+                })),
+            );
+            return groups.length === 0
+                ? `"${book}" has no inclusion groups yet.`
+                : `${groups.length} group${groups.length === 1 ? '' : 's'} in "${book}".`;
+        },
+    }));
+
+    $('#lvt_group_undo').on('click', () => runAction({
+        confirmHeader: 'Undo last grouping change?',
+        confirmText: 'Restores the group, priority, weight and scoring fields as they were before the last bulk change in this lorebook.',
+        run: async (book) => {
+            const n = await undoGrouping(book);
+            renderGroupResults('Undone', []);
+            return `Restored group settings on ${n} entr${n === 1 ? 'y' : 'ies'}.`;
+        },
+    }));
+
     $('#lvt_auto_bank')
         .prop('checked', getSettings().autoBank)
         .on('input', function () {
@@ -1213,6 +1808,7 @@ function addSettingsPanel() {
 
     $('#lvt_book_select').on('change', () => {
         refreshBankList();
+        $('#lvt_group_results').empty();
         setStatus('');
     });
 
@@ -1374,6 +1970,104 @@ function registerCommands() {
             }
             const { restored } = await restoreBank(book, latest.id);
             return String(restored);
+        },
+    }));
+
+    /** Shared defaults so the command behaves like the panel with nothing ticked off. */
+    const groupCommandOptions = (args, mode) => ({
+        terms: splitTerms(args.term),
+        groupName: String(args.name ?? '').trim(),
+        mode,
+        allowPerGroup: Math.max(1, Math.round(Number(args.allow) || 1)),
+        scope: {
+            title: !args.scope || String(args.scope).includes('title'),
+            keys: !args.scope || String(args.scope).includes('keys'),
+            content: !args.scope || String(args.scope).includes('content'),
+        },
+        wholeWord: String(args.whole ?? 'true') !== 'false',
+        caseSensitive: String(args.case ?? 'false') === 'true',
+        skipDisabled: true,
+        applySettings: false,
+        prioritize: false,
+        weight: DEFAULT_GROUP_WEIGHT,
+        scoring: null,
+    });
+
+    const groupNamedArgs = () => [
+        SlashCommandNamedArgument.fromProps({
+            name: 'term',
+            description: 'word(s) to match, comma-separated',
+            typeList: [ARGUMENT_TYPE.STRING],
+            isRequired: true,
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'name',
+            description: 'group name (blank = one group per matched word)',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'scope',
+            description: 'where to look: any of title, keys, content (default: all)',
+            typeList: [ARGUMENT_TYPE.STRING],
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'whole',
+            description: 'whole words only (default true)',
+            typeList: [ARGUMENT_TYPE.BOOLEAN],
+        }),
+        SlashCommandNamedArgument.fromProps({
+            name: 'case',
+            description: 'case sensitive (default false)',
+            typeList: [ARGUMENT_TYPE.BOOLEAN],
+        }),
+    ];
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lvt-group',
+        helpString: 'Puts every entry matching a word into an inclusion group. Example: /lvt-group term=dorm name=locations My Lorebook',
+        returns: 'number of entries changed',
+        namedArgumentList: [
+            ...groupNamedArgs(),
+            SlashCommandNamedArgument.fromProps({
+                name: 'allow',
+                description: 'how many entries may fire per turn (default 1)',
+                typeList: [ARGUMENT_TYPE.NUMBER],
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'mode',
+                description: 'replace (default), append, or fill',
+                typeList: [ARGUMENT_TYPE.STRING],
+                enumList: ['replace', 'append', 'fill'].map(x => new SlashCommandEnumValue(x)),
+            }),
+        ],
+        unnamedArgumentList: [bookArgument()],
+        callback: async (args, value) => {
+            const mode = String(args.mode ?? 'replace');
+            const { changed } = await applyGrouping(String(value), groupCommandOptions(args, mode));
+            return String(changed);
+        },
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lvt-ungroup',
+        helpString: 'Clears the inclusion group on every entry matching a word.',
+        returns: 'number of entries changed',
+        namedArgumentList: groupNamedArgs(),
+        unnamedArgumentList: [bookArgument()],
+        callback: async (args, value) => {
+            const { changed } = await applyGrouping(String(value), groupCommandOptions(args, 'clear'));
+            return String(changed);
+        },
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lvt-groups',
+        helpString: 'Lists the inclusion groups in the named lorebook with member counts.',
+        returns: 'group names and counts',
+        unnamedArgumentList: [bookArgument()],
+        callback: async (_args, value) => {
+            const groups = await listGroups(String(value));
+            return groups.map(g => `${g.name}: ${g.count}`).join('\n');
         },
     }));
 

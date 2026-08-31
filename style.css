@@ -33,6 +33,27 @@
     min-height: 36px;
 }
 
+/* The grouping form is the only part of the panel with free-text inputs;
+   they want the full width and a little air under each label. */
+.lvt-panel > .inline-drawer > .inline-drawer-content > label {
+    display: block;
+    font-size: 0.9em;
+    opacity: 0.8;
+    margin: 6px 0 2px;
+}
+
+.lvt-panel > .inline-drawer > .inline-drawer-content > label.checkbox_label {
+    display: flex;
+    margin: 2px 0;
+    opacity: 1;
+}
+
+.lvt-panel input.text_pole,
+.lvt-panel select.text_pole {
+    width: 100%;
+    margin-bottom: 4px;
+}
+
 .lvt-panel .lvt-danger {
     border-color: var(--crimson70a, #b3404a);
 }
@@ -69,6 +90,17 @@
     border-radius: 6px;
     padding: 6px;
     font-size: 0.85em;
+}
+
+/* Preview lists sit above the buttons you are about to press, so they get a
+   shorter cap than the activation log to keep the controls on screen. */
+.lvt-panel .lvt-preview {
+    max-height: 30vh;
+    margin-bottom: 6px;
+}
+
+.lvt-panel .lvt-preview:empty {
+    display: none;
 }
 
 .lvt-panel .lvt-log-empty {
