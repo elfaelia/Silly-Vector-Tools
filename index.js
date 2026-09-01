@@ -573,6 +573,10 @@ const VECTOR_FILES_TAG = '4_vectors_data_bank';
 /** @type {{index: number, name: string, preview: string, isUser: boolean}[]} */
 let lastChatMemories = [];
 let lastDataBankChars = 0;
+/** Raw slot contents, kept so the diagnostic can tell "nothing recalled" from
+ *  "recalled but not matched back to a message". */
+let lastInjectedChatText = '';
+let lastCaptureAt = null;
 
 /**
  * getPromptText() collapses runs of newlines before joining, so the injected
@@ -590,9 +594,12 @@ function normaliseForMatch(text) {
 function captureChatMemories() {
     const injected = String(extension_prompts?.[VECTOR_CHAT_TAG]?.value ?? '');
     lastDataBankChars = String(extension_prompts?.[VECTOR_FILES_TAG]?.value ?? '').length;
+    lastInjectedChatText = injected;
+    lastCaptureAt = new Date();
 
     if (!injected.trim()) {
         lastChatMemories = [];
+        trace('CHAT_MEMORIES: slot empty');
         return;
     }
 
@@ -612,6 +619,19 @@ function captureChatMemories() {
         // Compare on a prefix: the tail of a long message may be truncated in
         // the template, but the opening is reproduced verbatim.
         if (haystack.includes(text.slice(0, 80))) {
+            found.push({
+                index,
+                name: String(message?.name ?? '?'),
+                preview: truncate(text, 70),
+                isUser: !!message?.is_user,
+            });
+            continue;
+        }
+
+        // Macros are substituted before injection ({{user}} becomes a name), so
+        // a message containing them won't match on its opening. Fall back to a
+        // distinctive run from the middle, which is usually macro-free.
+        if (text.length >= 60 && haystack.includes(text.slice(30, 90))) {
             found.push({
                 index,
                 name: String(message?.name ?? '?'),
@@ -914,6 +934,113 @@ async function fillDetails(container, item) {
 
     container.append(scoreButton);
     container.append(scoreLine);
+}
+
+/**
+ * Walks the preconditions for chat recall in the order the vectors extension
+ * checks them, and reports the first one that fails. Nothing here changes any
+ * setting — it only explains why the list came back empty.
+ * @returns {Promise<{left: string, text: string, right: string}[]>}
+ */
+async function diagnoseChatRecall() {
+    const settings = extension_settings.vectors ?? {};
+    const context = getContext();
+    const chat = context?.chat ?? [];
+    const chatId = context?.chatId;
+    const rows = [];
+
+    const ok = (text, right = '') => rows.push({ left: '✅', text, right });
+    const bad = (text, right = '') => rows.push({ left: '❌', text, right });
+    const warn = (text, right = '') => rows.push({ left: '⚠️', text, right });
+
+    if (!settings.enabled_chats) {
+        bad('"Enabled for chat messages" is off in Vector Storage', 'fix this first');
+        return rows;
+    }
+
+    ok('Chat vectorisation is enabled');
+
+    if (!chatId) {
+        bad('No chat is open');
+        return rows;
+    }
+
+    const protect = Number(settings.protect) || 5;
+    const insert = Number(settings.insert) || 3;
+    const threshold = Number(settings.score_threshold) || 0.25;
+
+    // The last `protect` messages are already in context verbatim, so they are
+    // deliberately excluded from recall.
+    const recallable = Math.max(0, chat.length - protect);
+
+    if (chat.length < protect) {
+        bad(`Chat is ${chat.length} messages, Retain# is ${protect}`, 'too short');
+        rows.push({ left: '·', text: `Recall does nothing until the chat is longer than ${protect} messages.`, right: '' });
+        return rows;
+    }
+
+    ok(`${recallable} message${recallable === 1 ? '' : 's'} old enough to recall`, `Retain# ${protect}`);
+
+    let stored = [];
+
+    try {
+        stored = await getSavedHashes(String(chatId));
+    } catch (error) {
+        bad(`Could not read the chat's vector store: ${error.message}`);
+        return rows;
+    }
+
+    if (stored.length === 0) {
+        bad('No messages are indexed for this chat', 'press Vectorize All');
+        rows.push({ left: '·', text: 'Messages are only indexed as they are sent while chat vectorisation is on. Anything older needs Vectorize All in Vector Storage.', right: '' });
+        return rows;
+    }
+
+    // Messages sent before the feature was switched on never got indexed, and
+    // that gap is invisible in the Vector Storage UI.
+    if (stored.length < recallable) {
+        warn(`Only ${stored.length} of ${recallable} are indexed`, 'run Vectorize All');
+    } else {
+        ok(`${stored.length} messages indexed`);
+    }
+
+    ok(`Query uses the last ${Number(settings.query) || 2} message${(Number(settings.query) || 2) === 1 ? '' : 's'}`);
+    ok(`Would insert up to ${insert}, threshold ${threshold}`);
+
+    if (threshold > 0.5) {
+        warn(`Threshold ${threshold} is high — few messages will clear it`, 'try 0.25');
+    }
+
+    // The decisive check: was the injection slot actually filled? An empty slot
+    // means recall returned nothing. A full slot with no matched rows means
+    // recall worked and the message matching below it failed.
+    if (lastCaptureAt === null) {
+        warn('No generation seen yet this session', 'send a message');
+        return rows;
+    }
+
+    if (!lastInjectedChatText.trim()) {
+        bad('Nothing was injected last generation', 'recall found nothing');
+        rows.push({
+            left: '·',
+            text: `Everything above is configured correctly, so no message scored above ${threshold} against your last ${Number(settings.query) || 2}. Lower the threshold to around 0.15 and try again, or say something that echoes an older message.`,
+            right: '',
+        });
+        return rows;
+    }
+
+    ok(`${lastInjectedChatText.length} characters were injected last generation`);
+
+    if (lastChatMemories.length === 0) {
+        bad('But none matched back to a message', 'display bug, not recall');
+        rows.push({ left: '·', text: 'Recall is working — the panel just could not line the text up with your chat. Raw text below:', right: '' });
+        rows.push({ left: '"', text: truncate(lastInjectedChatText.replace(/\s+/g, ' ').trim(), 300), right: '' });
+        return rows;
+    }
+
+    ok(`${lastChatMemories.length} matched back to chat messages`);
+
+    return rows;
 }
 
 /**
@@ -2399,6 +2526,10 @@ function addSettingsPanel() {
         <div class="lvt-subhead">Recalled chat messages</div>
         <div id="lvt_chat_memories" class="lvt-log"></div>
         <div class="lvt-hint">Old messages the vectors extension pulled back into context. 🟣 you, 🟠 the character. "N back" is how far up the chat it came from.</div>
+        <div class="lvt-buttons">
+            <button id="lvt_diagnose" class="menu_button">Why is nothing being recalled?</button>
+        </div>
+        <div id="lvt_diagnose_results" class="lvt-log lvt-preview"></div>
 
         <div class="lvt-subhead">Event trace</div>
         <div id="lvt_trace" class="lvt-log lvt-trace"></div>
@@ -2453,6 +2584,18 @@ function addSettingsPanel() {
     $('#lvt_refresh').on('click', () => {
         refreshBookList();
         setStatus('List refreshed.');
+    });
+
+    $('#lvt_diagnose').on('click', async () => {
+        const container = $('#lvt_diagnose_results');
+        container.empty().append('<div class="lvt-log-empty">Checking…</div>');
+
+        try {
+            const rows = await diagnoseChatRecall();
+            renderResultList(container, 'Chat recall checklist', rows);
+        } catch (error) {
+            renderResultList(container, 'Check failed', [{ left: '❌', text: String(error.message ?? error), right: '' }]);
+        }
     });
 
     $('#lvt_trace_copy').on('click', async () => {
