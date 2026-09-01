@@ -1,4 +1,4 @@
-import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
+import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types, extension_prompts } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import {
     world_names,
@@ -556,6 +556,75 @@ async function measureSimilarity(world, contentHash, onProgress = () => {}) {
     return { score: (low + high) / 2, precision: (high - low) / 2, probes };
 }
 
+// ---------------------------------------------------------------------------
+// Chat vector memories
+//
+// The vectors extension retrieves old chat messages by similarity and drops
+// them into an extension prompt rather than emitting an event, so there is
+// nothing to listen for. But the injected text is readable, and it is built
+// from message text verbatim — so matching it back against the chat recovers
+// exactly which messages were pulled.
+// ---------------------------------------------------------------------------
+
+/** Injection slots used by the vectors extension. */
+const VECTOR_CHAT_TAG = '3_vectors';
+const VECTOR_FILES_TAG = '4_vectors_data_bank';
+
+/** @type {{index: number, name: string, preview: string, isUser: boolean}[]} */
+let lastChatMemories = [];
+let lastDataBankChars = 0;
+
+/**
+ * getPromptText() collapses runs of newlines before joining, so the injected
+ * copy of a message won't be byte-identical to the original.
+ * @param {string} text
+ * @returns {string}
+ */
+function normaliseForMatch(text) {
+    return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Works out which past messages the vectors extension retrieved this turn.
+ */
+function captureChatMemories() {
+    const injected = String(extension_prompts?.[VECTOR_CHAT_TAG]?.value ?? '');
+    lastDataBankChars = String(extension_prompts?.[VECTOR_FILES_TAG]?.value ?? '').length;
+
+    if (!injected.trim()) {
+        lastChatMemories = [];
+        return;
+    }
+
+    const haystack = normaliseForMatch(injected);
+    const chat = getContext()?.chat ?? [];
+    const found = [];
+
+    for (const [index, message] of chat.entries()) {
+        const text = normaliseForMatch(message?.mes);
+
+        // Very short messages ("ok", "...") produce false positives against a
+        // long injected block, so they're left out rather than guessed at.
+        if (text.length < 12) {
+            continue;
+        }
+
+        // Compare on a prefix: the tail of a long message may be truncated in
+        // the template, but the opening is reproduced verbatim.
+        if (haystack.includes(text.slice(0, 80))) {
+            found.push({
+                index,
+                name: String(message?.name ?? '?'),
+                preview: truncate(text, 70),
+                isUser: !!message?.is_user,
+            });
+        }
+    }
+
+    lastChatMemories = found;
+    trace(`CHAT_MEMORIES: ${found.length} matched, ${injected.length} chars injected`);
+}
+
 /**
  * @param {object} entry
  * @returns {string}
@@ -636,7 +705,20 @@ function initActivationTracking() {
         pendingVectorKeys = new Set();
         sawActivationThisGeneration = false;
         lastQueryText = buildQueryText();
+        lastChatMemories = [];
+        lastDataBankChars = 0;
         trace('GENERATION_STARTED');
+    });
+
+    // Chat memories are injected by a generation interceptor, which runs well
+    // before this — by GENERATE_AFTER_DATA the slot is filled and stable.
+    eventSource.on(event_types.GENERATE_AFTER_DATA, () => {
+        try {
+            captureChatMemories();
+            renderChatMemories();
+        } catch (error) {
+            console.error(`${MODULE}: failed to read chat memories`, error);
+        }
     });
 
     eventSource.on(event_types.WORLDINFO_FORCE_ACTIVATE, (entries) => {
@@ -832,6 +914,66 @@ async function fillDetails(container, item) {
 
     container.append(scoreButton);
     container.append(scoreLine);
+}
+
+/**
+ * Renders which past messages were pulled back into context this turn.
+ */
+function renderChatMemories() {
+    const container = $('#lvt_chat_memories');
+
+    if (container.length === 0) {
+        return;
+    }
+
+    container.empty();
+
+    const settings = extension_settings.vectors ?? {};
+
+    if (!settings.enabled_chats) {
+        container.append('<div class="lvt-log-empty">Chat vectorisation is off in Vector Storage.</div>');
+        return;
+    }
+
+    if (lastChatMemories.length === 0) {
+        container.append($('<div class="lvt-log-empty"></div>').text(
+            lastDataBankChars > 0
+                ? 'No past messages retrieved this turn (data bank text was injected).'
+                : 'No past messages retrieved this turn.',
+        ));
+        return;
+    }
+
+    const depth = Number.isFinite(Number(settings.depth)) ? `, injected at depth ${settings.depth}` : '';
+    container.append($('<div class="lvt-log-head"></div>').text(
+        `${lastChatMemories.length} message${lastChatMemories.length === 1 ? '' : 's'} recalled${depth}`,
+    ));
+
+    const chatLength = getContext()?.chat?.length ?? 0;
+
+    for (const memory of lastChatMemories) {
+        const row = $('<div class="lvt-log-row"></div>');
+        // How far back it came from is the useful part — recalling something
+        // from 200 messages ago is the feature working, recalling message 3 of
+        // 5 usually means the protect window is too small.
+        const back = chatLength > 0 ? `${chatLength - memory.index} back` : `#${memory.index}`;
+
+        row.append($('<span class="lvt-log-badge"></span>').text(memory.isUser ? '🟣' : '🟠'));
+        row.append($('<span class="lvt-log-name"></span>').text(`${memory.name}: ${memory.preview}`));
+        row.append($('<span class="lvt-log-world"></span>').text(back));
+
+        row.on('click', function () {
+            $(this).toggleClass('lvt-expanded');
+        });
+
+        container.append(row);
+    }
+
+    if (lastDataBankChars > 0) {
+        container.append($('<div class="lvt-log-empty"></div>').text(
+            `Plus ${lastDataBankChars} characters from the data bank.`,
+        ));
+    }
 }
 
 /** @returns {{vector: number, keyword: number, constant: number}} */
@@ -2250,9 +2392,13 @@ function addSettingsPanel() {
         </div>`;
 
     const activity = `
-        <div class="lvt-subhead">Last activation</div>
+        <div class="lvt-subhead">Lorebook entries</div>
         <div id="lvt_activation_log" class="lvt-log"></div>
         <div class="lvt-hint">Tap an entry to see why it fired. Vector hits can be measured for similarity.</div>
+
+        <div class="lvt-subhead">Recalled chat messages</div>
+        <div id="lvt_chat_memories" class="lvt-log"></div>
+        <div class="lvt-hint">Old messages the vectors extension pulled back into context. 🟣 you, 🟠 the character. "N back" is how far up the chat it came from.</div>
 
         <div class="lvt-subhead">Event trace</div>
         <div id="lvt_trace" class="lvt-log lvt-trace"></div>
@@ -2877,6 +3023,7 @@ jQuery(async () => {
     initActivationTracking();
     initAutoSync();
     renderActivationLog();
+    renderChatMemories();
     renderTrace();
     console.log(`${MODULE}: loaded`);
 });
