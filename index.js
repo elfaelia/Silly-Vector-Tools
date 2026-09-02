@@ -557,6 +557,88 @@ async function measureSimilarity(world, contentHash, onProgress = () => {}) {
 }
 
 /**
+ * Shows what a sample of real messages looks like after boilerplate stripping,
+ * so the patterns can be checked against the actual chat before committing to
+ * a re-vectorise. Uses the exact function the vectors extension uses, imported
+ * from the patched file, so this can never drift from the real behaviour.
+ * @returns {Promise<{left: string, text: string, right: string}[]>}
+ */
+async function previewStripping() {
+    const chat = getContext()?.chat ?? [];
+    const rows = [];
+
+    let stripBoilerplate = null;
+
+    for (const path of ['../vectors/index.js', '/scripts/extensions/vectors/index.js']) {
+        try {
+            const module = await import(/* webpackIgnore: true */ path);
+
+            if (typeof module?.stripBoilerplate === 'function') {
+                stripBoilerplate = module.stripBoilerplate;
+                break;
+            }
+        } catch {
+            // Try the next candidate.
+        }
+    }
+
+    if (!stripBoilerplate) {
+        rows.push({ left: '❌', text: 'Could not load stripBoilerplate from the vectors extension.', right: 'not patched?' });
+        rows.push({ left: '·', text: 'This needs the patched vectors/index.js in place. If you have installed it, the export may be missing.', right: '' });
+        return rows;
+    }
+
+    // Spread the sample across the whole chat rather than the recent tail,
+    // since older messages may use an older board format.
+    const step = Math.max(1, Math.floor(chat.length / 12));
+    const sample = [];
+
+    for (let i = 0; i < chat.length && sample.length < 12; i += step) {
+        if (String(chat[i]?.mes ?? '').trim()) {
+            sample.push([i, String(chat[i].mes)]);
+        }
+    }
+
+    let totalBefore = 0;
+    let totalAfter = 0;
+    let untouched = 0;
+
+    for (const [index, raw] of sample) {
+        const stripped = stripBoilerplate(raw);
+        totalBefore += raw.length;
+        totalAfter += stripped.length;
+
+        if (stripped.length === raw.length) {
+            untouched++;
+        }
+
+        const empty = stripped.trim().length === 0;
+
+        rows.push({
+            left: empty ? '⚠️' : '🔗',
+            text: empty
+                ? '(nothing left — this message was entirely boilerplate)'
+                : truncate(stripped.replace(/\s+/g, ' ').trim(), 200),
+            right: `msg ${index} · ${raw.length}→${stripped.length}`,
+        });
+    }
+
+    const saved = totalBefore > 0 ? Math.round(100 - (totalAfter / totalBefore) * 100) : 0;
+
+    rows.push({ left: '·', text: `Across this sample, stripping removes ${saved}% of the text that would be embedded.`, right: '' });
+
+    if (untouched === sample.length) {
+        rows.push({ left: '⚠️', text: 'No message in the sample was changed. The patterns are not matching your board — check the format against BOILERPLATE_PATTERNS at the top of vectors/index.js.', right: 'no matches' });
+    } else if (untouched > 0) {
+        rows.push({ left: '·', text: `${untouched} of ${sample.length} sampled messages were left unchanged, which is expected for plain prose turns.`, right: '' });
+    }
+
+    rows.push({ left: '·', text: 'If the text above still contains board fields, the patterns need adjusting before you re-vectorise.', right: '' });
+
+    return rows;
+}
+
+/**
  * Queries the chat's own collection directly, bypassing everything the vectors
  * extension does to the result afterwards.
  *
@@ -2782,6 +2864,7 @@ function addSettingsPanel() {
         <div class="lvt-buttons">
             <button id="lvt_diagnose" class="menu_button">Why is nothing being recalled?</button>
             <button id="lvt_probe" class="menu_button lvt-primary">Probe the chat collection</button>
+            <button id="lvt_preview_strip" class="menu_button">Preview what gets embedded</button>
         </div>
         <div id="lvt_diagnose_results" class="lvt-log lvt-preview"></div>
 
@@ -2861,6 +2944,18 @@ function addSettingsPanel() {
             renderResultList(container, 'Raw chat collection probe', rows);
         } catch (error) {
             renderResultList(container, 'Probe failed', [{ left: '❌', text: String(error.message ?? error), right: '' }]);
+        }
+    });
+
+    $('#lvt_preview_strip').on('click', async () => {
+        const container = $('#lvt_diagnose_results');
+        container.empty().append('<div class="lvt-log-empty">Sampling…</div>');
+
+        try {
+            const rows = await previewStripping();
+            renderResultList(container, 'What gets embedded after stripping', rows);
+        } catch (error) {
+            renderResultList(container, 'Preview failed', [{ left: '❌', text: String(error.message ?? error), right: '' }]);
         }
     });
 
