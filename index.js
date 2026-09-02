@@ -9,7 +9,6 @@ import {
     originalWIDataKeyMap,
 } from '../../../world-info.js';
 import { getStringHash } from '../../../utils.js';
-import { getRegexedString, regex_placement } from '../regex/engine.js';
 import { Popup, POPUP_RESULT } from '../../../popup.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
@@ -733,30 +732,46 @@ async function probeChatRecall() {
     // raw message, but looks them up against coreChat, which has already been
     // through the prompt-side regex scripts. Any script that rewrites messages
     // for the prompt changes the hash and the lookup silently finds nothing.
-    const promptHashes = new Set(
-        chat.map((x, i) => {
-            const placement = x?.is_user ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
-            const regexed = getRegexedString(String(x?.mes ?? ''), placement, {
-                isPrompt: true,
-                depth: chat.length - i - 1,
-            });
-            return getStringHash(substituteParams(regexed));
-        }),
+    //
+    // Imported lazily and defensively: the module path has moved between
+    // SillyTavern versions, and a failed static import takes the whole
+    // extension down rather than just this one check.
+    let regexEngine = null;
+
+    for (const path of ['../../regex/engine.js', '../regex/engine.js', '/scripts/extensions/regex/engine.js']) {
+        try {
+            const module = await import(/* webpackIgnore: true */ path);
+
+            if (typeof module?.getRegexedString === 'function' && module?.regex_placement) {
+                regexEngine = module;
+                break;
+            }
+        } catch {
+            // Try the next candidate.
+        }
+    }
+
+    if (!regexEngine) {
+        warn('Could not load the regex engine', 'check skipped');
+        note('This check compares the raw message hash against the hash after prompt-side regex runs. Without the module it cannot run, but nothing else is affected.');
+        return rows;
+    }
+
+    const { getRegexedString, regex_placement } = regexEngine;
+
+    const promptText = (x, i) => getRegexedString(
+        String(x?.mes ?? ''),
+        x?.is_user ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT,
+        { isPrompt: true, depth: chat.length - i - 1 },
     );
 
+    const promptHashes = new Set(chat.map((x, i) => getStringHash(substituteParams(promptText(x, i)))));
     const survives = usable.filter(hash => promptHashes.has(Number(hash)));
-    const altered = chat.filter((x, i) => {
-        const placement = x?.is_user ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
-        const regexed = getRegexedString(String(x?.mes ?? ''), placement, {
-            isPrompt: true,
-            depth: chat.length - i - 1,
-        });
-        return regexed !== String(x?.mes ?? '');
-    }).length;
+    const altered = chat.filter((x, i) => promptText(x, i) !== String(x?.mes ?? '')).length;
 
     if (mappable.length > 0 && survives.length === 0) {
         bad(`0 of ${mappable.length} survive prompt-side regex`, 'hash mismatch');
-        note(`${altered} of ${chat.length} messages are rewritten by regex before the prompt is built. Vectors are stored against the raw text but looked up against the rewritten text, so no hash ever matches and nothing is injected. Set any regex script that edits messages to affect Display only, not Prompt — or untick "Run on prompt" — then recall will start working with no re-vectorising needed.`);
+        note(`${altered} of ${chat.length} messages are rewritten by regex before the prompt is built. Vectors are stored against the raw text but looked up against the rewritten text, so no hash ever matches and nothing is injected. Set any regex script that edits messages to affect Display only, not Prompt, and recall will start working with no re-vectorising needed.`);
     } else if (survives.length > 0) {
         ok(`${survives.length} survive prompt-side regex`, 'mapping is intact');
         note(`${altered} of ${chat.length} messages are altered by prompt regex.`);
