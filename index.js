@@ -1,4 +1,4 @@
-import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types, extension_prompts } from '../../../../script.js';
+import { getRequestHeaders, saveSettingsDebounced, eventSource, event_types, extension_prompts, substituteParams } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import {
     world_names,
@@ -704,7 +704,31 @@ async function probeChatRecall() {
         note('These are the chunks being thrown away before injection. If most of the list is marked IN TAIL, raise Retain# so the recent messages stop being their own best matches, or raise the chunk size so chunks carry more distinct meaning.');
     }
 
-    trace(`PROBE: ${raw.hashes.length} raw, ${filtered.metadata.length} over threshold, ${inTail} in tail`);
+    // The step after retrieval: the vectors extension turns hashes back into
+    // messages by hashing each message in the chat and looking for a match. If
+    // the stored hashes are per-chunk rather than per-message, nothing matches
+    // and the injection comes out empty even though retrieval succeeded.
+    const messageHashes = new Set(
+        chat.map(x => getStringHash(substituteParams(String(x?.mes ?? '')))),
+    );
+
+    const usable = raw.hashes.filter((hash, i) => {
+        const index = Number(raw.metadata[i]?.index);
+        return !(Number.isFinite(index) && index >= cutoff);
+    });
+
+    const mappable = usable.filter(hash => messageHashes.has(Number(hash)));
+
+    if (usable.length === 0) {
+        warn('Every hit was inside the protected tail', 'nothing left to map');
+    } else if (mappable.length === 0) {
+        bad(`0 of ${usable.length} usable hits map back to a message`, 'chunking mismatch');
+        note(`Retrieval is working and the tail filter left ${usable.length} candidates, but none of their hashes match any message in this chat. Stored hashes are per-chunk (${raw.hashes.length ? 'chunking is on' : 'unknown'}), while the lookup hashes whole messages, so the injection is always empty. Set message chunk size to 0 in Vector Storage, then purge and re-vectorise.`);
+    } else {
+        ok(`${mappable.length} of ${usable.length} usable hits map back to a message`);
+    }
+
+    trace(`PROBE: ${raw.hashes.length} raw, ${filtered.metadata.length} over threshold, ${inTail} in tail, ${mappable.length}/${usable.length} mappable`);
 
     return rows;
 }
