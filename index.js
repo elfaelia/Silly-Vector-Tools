@@ -556,6 +556,159 @@ async function measureSimilarity(world, contentHash, onProgress = () => {}) {
     return { score: (low + high) / 2, precision: (high - low) / 2, probes };
 }
 
+/**
+ * Queries the chat's own collection directly, bypassing everything the vectors
+ * extension does to the result afterwards.
+ *
+ * diagnoseChatRecall() can only see whether the injection slot ended up empty,
+ * which conflates three different failures: the query returned nothing, the
+ * query threw and was swallowed, or the query returned hits that were then
+ * discarded during post-filtering. This separates them by reading the raw
+ * response.
+ *
+ * @param {string} searchText
+ * @param {number} threshold
+ * @returns {Promise<{hashes: number[], metadata: object[], status: number, error: string}>}
+ */
+async function queryChatCollection(searchText, threshold = 0) {
+    const source = getSource();
+    const chatId = getContext()?.chatId;
+
+    if (!chatId) {
+        throw new Error('No chat is open.');
+    }
+
+    const response = await fetch('/api/vector/query', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            ...buildVectorsRequestBody(source),
+            collectionId: String(chatId),
+            searchText,
+            topK: 20,
+            threshold,
+            source,
+        }),
+    });
+
+    // The body of a failed embedding call carries the actual reason — wrong
+    // dimensions, expired key, rate limit. The vectors extension discards it.
+    if (!response.ok) {
+        let detail = '';
+
+        try {
+            detail = (await response.text()).slice(0, 300);
+        } catch {
+            detail = '(no body)';
+        }
+
+        return { hashes: [], metadata: [], status: response.status, error: detail };
+    }
+
+    const result = await response.json();
+
+    return {
+        hashes: Array.isArray(result?.hashes) ? result.hashes : [],
+        metadata: Array.isArray(result?.metadata) ? result.metadata : [],
+        status: response.status,
+        error: '',
+    };
+}
+
+/**
+ * Runs the probe and formats it for the results list. Reports what came back
+ * at threshold 0 first, since that is the "is retrieval working at all"
+ * question, then how much of it would survive the configured threshold and the
+ * protected-tail filter.
+ * @returns {Promise<{left: string, text: string, right: string}[]>}
+ */
+async function probeChatRecall() {
+    const settings = extension_settings.vectors ?? {};
+    const chat = getContext()?.chat ?? [];
+    const protect = Number(settings.protect) || 5;
+    const threshold = Number(settings.score_threshold) || 0.25;
+    const rows = [];
+
+    const ok = (text, right = '') => rows.push({ left: '✅', text, right });
+    const bad = (text, right = '') => rows.push({ left: '❌', text, right });
+    const warn = (text, right = '') => rows.push({ left: '⚠️', text, right });
+    const note = (text, right = '') => rows.push({ left: '·', text, right });
+
+    const searchText = buildQueryText();
+
+    if (!searchText) {
+        bad('Query text is empty', 'nothing to search with');
+        note('The last few messages are blank or hidden, so there is no query to embed.');
+        return rows;
+    }
+
+    note(`Query: "${truncate(searchText.replace(/\s+/g, ' ').trim(), 120)}"`, `${searchText.length} chars`);
+    trace(`PROBE: querying chat collection with ${searchText.length} chars`);
+
+    const raw = await queryChatCollection(searchText, 0);
+
+    // A failure here is the whole answer: the collection was never being
+    // searched successfully, and no amount of threshold tuning would show it.
+    if (raw.error) {
+        bad(`Query failed (HTTP ${raw.status})`, 'server rejected it');
+        note(raw.error);
+        return rows;
+    }
+
+    if (raw.hashes.length === 0) {
+        bad('Collection returned nothing at threshold 0', 'empty or mismatched');
+        note('Hashes are listed unfiltered, so zero here means the collection being queried is empty — which is not the same collection /api/vector/list is reading. Check for a stale chat id.');
+        return rows;
+    }
+
+    ok(`${raw.hashes.length} chunks returned at threshold 0`, 'retrieval works');
+
+    // Everything below this point is post-filtering, i.e. results that were
+    // found and then thrown away.
+    const filtered = await queryChatCollection(searchText, threshold);
+
+    if (filtered.metadata.length === 0) {
+        warn(`None survive your threshold of ${threshold}`, 'lower it');
+    } else {
+        ok(`${filtered.metadata.length} survive threshold ${threshold}`);
+    }
+
+    // ST drops any hit whose source message is already in the protected tail,
+    // because it is in context verbatim. Fragmented chunks make the recent
+    // messages their own nearest neighbours, which empties the slot silently.
+    const cutoff = Math.max(0, chat.length - protect);
+    const pool = filtered.metadata.length > 0 ? filtered.metadata : raw.metadata;
+    let inTail = 0;
+
+    for (const item of pool.slice(0, 10)) {
+        const index = Number(item?.index);
+        const recent = Number.isFinite(index) && index >= cutoff;
+
+        if (recent) {
+            inTail++;
+        }
+
+        const where = Number.isFinite(index)
+            ? (recent ? `msg ${index} — IN TAIL` : `msg ${index}`)
+            : 'no index';
+
+        rows.push({
+            left: recent ? '🚫' : '🔗',
+            text: truncate(String(item?.text ?? '(no text stored)').replace(/\s+/g, ' ').trim(), 160),
+            right: where,
+        });
+    }
+
+    if (inTail > 0) {
+        warn(`${inTail} of the top hits are inside the last ${protect} messages`, 'discarded as already in context');
+        note('These are the chunks being thrown away before injection. If most of the list is marked IN TAIL, raise Retain# so the recent messages stop being their own best matches, or raise the chunk size so chunks carry more distinct meaning.');
+    }
+
+    trace(`PROBE: ${raw.hashes.length} raw, ${filtered.metadata.length} over threshold, ${inTail} in tail`);
+
+    return rows;
+}
+
 // ---------------------------------------------------------------------------
 // Chat vector memories
 //
@@ -2528,6 +2681,7 @@ function addSettingsPanel() {
         <div class="lvt-hint">Old messages the vectors extension pulled back into context. 🟣 you, 🟠 the character. "N back" is how far up the chat it came from.</div>
         <div class="lvt-buttons">
             <button id="lvt_diagnose" class="menu_button">Why is nothing being recalled?</button>
+            <button id="lvt_probe" class="menu_button lvt-primary">Probe the chat collection</button>
         </div>
         <div id="lvt_diagnose_results" class="lvt-log lvt-preview"></div>
 
@@ -2595,6 +2749,18 @@ function addSettingsPanel() {
             renderResultList(container, 'Chat recall checklist', rows);
         } catch (error) {
             renderResultList(container, 'Check failed', [{ left: '❌', text: String(error.message ?? error), right: '' }]);
+        }
+    });
+
+    $('#lvt_probe').on('click', async () => {
+        const container = $('#lvt_diagnose_results');
+        container.empty().append('<div class="lvt-log-empty">Querying…</div>');
+
+        try {
+            const rows = await probeChatRecall();
+            renderResultList(container, 'Raw chat collection probe', rows);
+        } catch (error) {
+            renderResultList(container, 'Probe failed', [{ left: '❌', text: String(error.message ?? error), right: '' }]);
         }
     });
 
