@@ -9,6 +9,7 @@ import {
     originalWIDataKeyMap,
 } from '../../../world-info.js';
 import { getStringHash } from '../../../utils.js';
+import { getRegexedString, regex_placement } from '../regex/engine.js';
 import { Popup, POPUP_RESULT } from '../../../popup.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
@@ -726,6 +727,66 @@ async function probeChatRecall() {
         note(`Retrieval is working and the tail filter left ${usable.length} candidates, but none of their hashes match any message in this chat. Stored hashes are per-chunk (${raw.hashes.length ? 'chunking is on' : 'unknown'}), while the lookup hashes whole messages, so the injection is always empty. Set message chunk size to 0 in Vector Storage, then purge and re-vectorise.`);
     } else {
         ok(`${mappable.length} of ${usable.length} usable hits map back to a message`);
+    }
+
+    // The real mapping the vectors extension performs. It stores hashes of the
+    // raw message, but looks them up against coreChat, which has already been
+    // through the prompt-side regex scripts. Any script that rewrites messages
+    // for the prompt changes the hash and the lookup silently finds nothing.
+    const promptHashes = new Set(
+        chat.map((x, i) => {
+            const placement = x?.is_user ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
+            const regexed = getRegexedString(String(x?.mes ?? ''), placement, {
+                isPrompt: true,
+                depth: chat.length - i - 1,
+            });
+            return getStringHash(substituteParams(regexed));
+        }),
+    );
+
+    const survives = usable.filter(hash => promptHashes.has(Number(hash)));
+    const altered = chat.filter((x, i) => {
+        const placement = x?.is_user ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
+        const regexed = getRegexedString(String(x?.mes ?? ''), placement, {
+            isPrompt: true,
+            depth: chat.length - i - 1,
+        });
+        return regexed !== String(x?.mes ?? '');
+    }).length;
+
+    if (mappable.length > 0 && survives.length === 0) {
+        bad(`0 of ${mappable.length} survive prompt-side regex`, 'hash mismatch');
+        note(`${altered} of ${chat.length} messages are rewritten by regex before the prompt is built. Vectors are stored against the raw text but looked up against the rewritten text, so no hash ever matches and nothing is injected. Set any regex script that edits messages to affect Display only, not Prompt — or untick "Run on prompt" — then recall will start working with no re-vectorising needed.`);
+    } else if (survives.length > 0) {
+        ok(`${survives.length} survive prompt-side regex`, 'mapping is intact');
+        note(`${altered} of ${chat.length} messages are altered by prompt regex.`);
+    }
+
+    // Everything above tests the plumbing directly. This tests whether the
+    // vectors extension is using it: if recall is running but writing to a
+    // different key than VECTOR_CHAT_TAG, the panel would report an empty slot
+    // forever while the prompt was actually being filled correctly.
+    const slots = Object.entries(extension_prompts ?? {})
+        .map(([key, value]) => [key, String(value?.value ?? '').trim()])
+        .filter(([, text]) => text.length > 0);
+
+    if (slots.length === 0) {
+        warn('No extension prompt slots are filled at all', 'nothing injected by anything');
+    } else {
+        note(`Filled prompt slots: ${slots.map(([k, t]) => `${k} (${t.length})`).join(', ')}`);
+    }
+
+    const ours = slots.find(([key]) => key === VECTOR_CHAT_TAG);
+    const otherVector = slots.filter(([key]) => key !== VECTOR_CHAT_TAG && /vector/i.test(key));
+
+    if (ours) {
+        ok(`${VECTOR_CHAT_TAG} is filled`, `${ours[1].length} chars`);
+    } else if (otherVector.length > 0) {
+        bad(`Recall is writing to ${otherVector.map(([k]) => k).join(', ')}, not ${VECTOR_CHAT_TAG}`, 'wrong tag');
+        note('Recall is working — the panel is reading the wrong key for this SillyTavern version. Nothing is broken in your setup.');
+    } else {
+        bad(`${VECTOR_CHAT_TAG} is empty and no other vector slot exists`, 'recall did not run');
+        note('Retrieval works when called directly, but the vectors extension is not calling it. Check that "Enabled for chat messages" is ticked in Vector Storage.');
     }
 
     trace(`PROBE: ${raw.hashes.length} raw, ${filtered.metadata.length} over threshold, ${inTail} in tail, ${mappable.length}/${usable.length} mappable`);
