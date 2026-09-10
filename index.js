@@ -32,10 +32,19 @@ const CLIENT_SIDE_SOURCES = ['webllm', 'koboldcpp'];
 // first, falling back to a content hash so a re-imported book still restores.
 // ---------------------------------------------------------------------------
 
-/** @returns {{banks: Record<string, object[]>, autoBank: boolean, groupUndo: Record<string, object>, openSections: Record<string, boolean>}} */
+/** @returns {{banks: Record<string, object[]>, autoBank: boolean, groupUndo: Record<string, object>, openSections: Record<string, boolean>, excludedVectorChats: string[], excludedVectorBots: string[], chatVectorsMasterEnabled: boolean | null}} */
 function getSettings() {
     if (!extension_settings[SETTINGS_KEY]) {
-        extension_settings[SETTINGS_KEY] = { banks: {}, autoBank: true, autoSync: false, groupUndo: {}, openSections: {} };
+        extension_settings[SETTINGS_KEY] = {
+            banks: {},
+            autoBank: true,
+            autoSync: false,
+            groupUndo: {},
+            openSections: {},
+            excludedVectorChats: [],
+            excludedVectorBots: [],
+            chatVectorsMasterEnabled: null,
+        };
     }
 
     const settings = extension_settings[SETTINGS_KEY];
@@ -60,7 +69,219 @@ function getSettings() {
         settings.autoBank = true;
     }
 
+    if (!Array.isArray(settings.excludedVectorChats)) {
+        settings.excludedVectorChats = [];
+    }
+
+    if (!Array.isArray(settings.excludedVectorBots)) {
+        settings.excludedVectorBots = [];
+    }
+
+    settings.excludedVectorChats = [...new Set(settings.excludedVectorChats.map(String).filter(Boolean))];
+    settings.excludedVectorBots = [...new Set(settings.excludedVectorBots.map(String).filter(Boolean))];
+
+    if (typeof settings.chatVectorsMasterEnabled !== 'boolean') {
+        settings.chatVectorsMasterEnabled = null;
+    }
+
     return settings;
+}
+
+/**
+ * SillyTavern's Vector Storage switch is global. These helpers keep the user's
+ * global choice as the master value, while making its internal switch false
+ * whenever the current chat or character is excluded. Lorebook and Data Bank
+ * vectorisation are separate switches and are never touched.
+ */
+let applyingChatVectorPolicy = false;
+let chatVectorPolicyTimer = null;
+
+function getCurrentVectorScope() {
+    const context = getContext();
+    const chatId = String(context?.chatId ?? '').trim();
+
+    if (!chatId) {
+        return { chatKey: '', botKey: '', botLabel: 'character', chatId: '' };
+    }
+
+    if (context?.groupId) {
+        const groupId = String(context.groupId);
+        const group = context.groups?.find(x => String(x.id) === groupId);
+        return {
+            chatKey: `group:${groupId}::${chatId}`,
+            botKey: `group:${groupId}`,
+            botLabel: String(group?.name ?? 'this group'),
+            chatId,
+        };
+    }
+
+    const character = context?.characters?.[context.characterId];
+    const stableId = String(character?.avatar ?? character?.name ?? context?.characterId ?? '').trim();
+
+    if (!stableId) {
+        return { chatKey: '', botKey: '', botLabel: 'character', chatId };
+    }
+
+    return {
+        chatKey: `character:${stableId}::${chatId}`,
+        botKey: `character:${stableId}`,
+        botLabel: String(character?.name ?? context?.name2 ?? 'this character'),
+        chatId,
+    };
+}
+
+function getChatVectorExclusionState() {
+    const scope = getCurrentVectorScope();
+    const settings = getSettings();
+    const byChat = !!scope.chatKey && settings.excludedVectorChats.includes(scope.chatKey);
+    const byBot = !!scope.botKey && settings.excludedVectorBots.includes(scope.botKey);
+    return { ...scope, byChat, byBot, excluded: byChat || byBot };
+}
+
+function isChatVectorisationEnabled() {
+    const checkbox = $('#vectors_enabled_chats');
+    return checkbox.length > 0
+        ? !!checkbox.prop('checked')
+        : !!extension_settings.vectors?.enabled_chats;
+}
+
+function getChatVectorsMasterEnabled() {
+    const settings = getSettings();
+
+    if (typeof settings.chatVectorsMasterEnabled !== 'boolean') {
+        settings.chatVectorsMasterEnabled = isChatVectorisationEnabled();
+        saveSettingsDebounced();
+    }
+
+    return settings.chatVectorsMasterEnabled;
+}
+
+function updateChatVectorExclusionUi() {
+    const state = getChatVectorExclusionState();
+    const masterEnabled = getChatVectorsMasterEnabled();
+    const hasChat = !!state.chatKey;
+
+    $('#lvt_exclude_vector_chat').prop('checked', state.byChat).prop('disabled', !hasChat);
+    $('#lvt_exclude_vector_bot').prop('checked', state.byBot).prop('disabled', !state.botKey);
+    $('#lvt_vector_bot_label').text(state.botLabel === 'character' ? 'this character' : state.botLabel);
+
+    let message = 'Open a chat to choose its vector settings.';
+
+    if (hasChat && state.excluded) {
+        const reason = state.byChat && state.byBot
+            ? 'this chat and its character/group are excluded'
+            : state.byBot
+                ? `${state.botLabel} is excluded`
+                : 'this chat is excluded';
+        message = `Chat-message vectorisation is off here because ${reason}. Existing embeddings are kept but will not be recalled.`;
+    } else if (hasChat && !masterEnabled) {
+        message = 'Chat-message vectorisation is globally off in Vector Storage.';
+    } else if (hasChat) {
+        message = 'Chat-message vectorisation and recall are on for this chat.';
+    }
+
+    $('#lvt_vector_exclusion_status').text(message);
+}
+
+function applyChatVectorPolicy() {
+    window.clearTimeout(chatVectorPolicyTimer);
+
+    const state = getChatVectorExclusionState();
+    const masterEnabled = getChatVectorsMasterEnabled();
+    const effectiveEnabled = masterEnabled && !state.excluded;
+    const checkbox = $('#vectors_enabled_chats');
+
+    if (checkbox.length > 0 && !!checkbox.prop('checked') !== effectiveEnabled) {
+        applyingChatVectorPolicy = true;
+        checkbox.prop('checked', effectiveEnabled).trigger('input');
+        applyingChatVectorPolicy = false;
+
+        // The built-in extension needs the effective value in its private
+        // settings object, but the persisted global preference must remain the
+        // user's master choice rather than whichever chat happened to be open.
+        if (extension_settings.vectors) {
+            extension_settings.vectors.enabled_chats = masterEnabled;
+            saveSettingsDebounced();
+        }
+    }
+
+    if (state.excluded) {
+        lastChatMemories = [];
+        lastInjectedChatText = '';
+    }
+
+    updateChatVectorExclusionUi();
+    renderChatMemories();
+}
+
+function scheduleChatVectorPolicy() {
+    window.clearTimeout(chatVectorPolicyTimer);
+    chatVectorPolicyTimer = window.setTimeout(applyChatVectorPolicy, 0);
+}
+
+function setCurrentVectorExclusion(kind, excluded) {
+    const state = getChatVectorExclusionState();
+    const settings = getSettings();
+    const key = kind === 'bot' ? state.botKey : state.chatKey;
+    const field = kind === 'bot' ? 'excludedVectorBots' : 'excludedVectorChats';
+
+    if (!key) {
+        return;
+    }
+
+    settings[field] = excluded
+        ? [...new Set([...settings[field], key])]
+        : settings[field].filter(x => x !== key);
+
+    saveSettingsDebounced();
+    applyChatVectorPolicy();
+}
+
+function initChatVectorExclusions() {
+    $('#lvt_exclude_vector_chat').on('input', function () {
+        setCurrentVectorExclusion('chat', !!$(this).prop('checked'));
+    });
+
+    $('#lvt_exclude_vector_bot').on('input', function () {
+        setCurrentVectorExclusion('bot', !!$(this).prop('checked'));
+    });
+
+    const bindMasterSwitch = (attempt = 0) => {
+        const checkbox = $('#vectors_enabled_chats');
+
+        if (checkbox.length === 0) {
+            if (attempt < 20) {
+                window.setTimeout(() => bindMasterSwitch(attempt + 1), 250);
+            }
+            return;
+        }
+
+        checkbox.off('input.lvt-vector-exclusions').on('input.lvt-vector-exclusions', function () {
+            if (applyingChatVectorPolicy) {
+                return;
+            }
+
+            getSettings().chatVectorsMasterEnabled = !!$(this).prop('checked');
+            saveSettingsDebounced();
+
+            if (getChatVectorExclusionState().excluded) {
+                scheduleChatVectorPolicy();
+            } else {
+                updateChatVectorExclusionUi();
+                renderChatMemories();
+            }
+        });
+
+        applyChatVectorPolicy();
+    };
+
+    bindMasterSwitch();
+
+    if (event_types.CHAT_CHANGED) {
+        eventSource.on(event_types.CHAT_CHANGED, scheduleChatVectorPolicy);
+    }
+
+    scheduleChatVectorPolicy();
 }
 
 /**
@@ -2211,8 +2432,14 @@ async function diagnoseChatRecall() {
     const bad = (text, right = '') => rows.push({ left: '❌', text, right });
     const warn = (text, right = '') => rows.push({ left: '⚠️', text, right });
 
-    if (!settings.enabled_chats) {
-        bad('"Enabled for chat messages" is off in Vector Storage', 'fix this first');
+    if (!isChatVectorisationEnabled()) {
+        const excluded = getChatVectorExclusionState().excluded;
+        bad(
+            excluded
+                ? 'Chat vectorisation is disabled for this chat by Lorebook Vector Tools'
+                : '"Enabled for chat messages" is off in Vector Storage',
+            excluded ? 'excluded here' : 'fix this first',
+        );
         return rows;
     }
 
@@ -2315,8 +2542,12 @@ function renderChatMemories() {
 
     const settings = extension_settings.vectors ?? {};
 
-    if (!settings.enabled_chats) {
-        container.append('<div class="lvt-log-empty">Chat vectorisation is off in Vector Storage.</div>');
+    if (!isChatVectorisationEnabled()) {
+        container.append($('<div class="lvt-log-empty"></div>').text(
+            getChatVectorExclusionState().excluded
+                ? 'Chat vectorisation is disabled for this chat.'
+                : 'Chat vectorisation is off in Vector Storage.',
+        ));
         return;
     }
 
@@ -3830,6 +4061,20 @@ function addSettingsPanel() {
         </div>
         <div id="lvt_wi_results" class="lvt-log lvt-preview"></div>
 
+        <div class="lvt-subhead">Chat-message vectorisation</div>
+        <div class="lvt-checkgrid">
+            <label class="checkbox_label" for="lvt_exclude_vector_chat">
+                <input id="lvt_exclude_vector_chat" type="checkbox">
+                <span>Disable for this chat</span>
+            </label>
+            <label class="checkbox_label" for="lvt_exclude_vector_bot">
+                <input id="lvt_exclude_vector_bot" type="checkbox">
+                <span>Disable every chat with <b id="lvt_vector_bot_label">this character</b></span>
+            </label>
+        </div>
+        <div id="lvt_vector_exclusion_status" class="lvt-hint"></div>
+        <div class="lvt-hint">This affects chat memories only. Lorebook and Data Bank vectorisation keep their own global settings. Unticking an exclusion makes the stored chat memories available again.</div>
+
         <div class="lvt-subhead">Recalled chat messages</div>
         <div id="lvt_chat_memories" class="lvt-log"></div>
         <div class="lvt-hint">Old messages the vectors extension pulled back into context. 🟣 you, 🟠 the character. "N back" is how far up the chat it came from.</div>
@@ -4607,6 +4852,7 @@ jQuery(async () => {
     registerCommands();
     initActivationTracking();
     initAutoSync();
+    initChatVectorExclusions();
     renderActivationLog();
     renderDroppedVectorEntries();
     renderChatMemories();
