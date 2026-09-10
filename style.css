@@ -284,6 +284,14 @@
     flex: 0 0 auto;
 }
 
+/* A nominated-then-discarded entry. Dimmed because it is not in the prompt,
+   but tinted because it is the row worth reading when nothing is firing. */
+.lvt-panel .lvt-log-row.lvt-dropped .lvt-log-name {
+    opacity: 0.75;
+    text-decoration: line-through;
+    text-decoration-color: rgba(255, 120, 120, 0.5);
+}
+
 .lvt-panel .lvt-log-name {
     flex: 1;
     min-width: 0;

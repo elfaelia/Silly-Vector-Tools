@@ -427,22 +427,31 @@ let sawActivationThisGeneration = false;
 /** Query text as the vectors extension builds it — last N non-empty messages. */
 let lastQueryText = '';
 
+// The nomination side of the vectorised path. Keeping the whole entry rather
+// than just its key is what makes it possible to say *why* world-info.js threw
+// one away: the payload carries the group, probability, filters and decorators
+// the scan judged it on, and none of that is recoverable afterwards.
+/** @type {Map<string, object>} Entries nominated via WORLDINFO_FORCE_ACTIVATE. */
+let pendingVectorEntries = new Map();
+/** @type {object[]} Nominated entries that never reached the prompt. */
+let lastDroppedVectorEntries = [];
+let sawForceActivate = false;
+/** Generation type of the last run. 'quiet' and dry runs skip the vectors path. */
+let lastGenerationType = '';
+let lastGenerationDryRun = false;
+let lastGenerationAt = null;
+
 /**
  * Rebuilds the vector query string. Mirrors getQueryText() in the vectors
  * extension: newest messages first, empties dropped, capped at "Query messages".
  * @returns {string}
  */
 function buildQueryText() {
-    const chat = getContext()?.chat ?? [];
-    const count = Number(extension_settings.vectors?.query) || 2;
-
-    return chat
-        .map(x => String(x?.mes ?? '').trim())
-        .filter(Boolean)
-        .reverse()
-        .slice(0, count)
-        .join('\n')
-        .trim();
+    // Delegates to the faithful clone. The earlier version here skipped macro
+    // substitution, the attachment slice and the newline collapse, so on any
+    // chat using macros or file attachments it embedded different text than
+    // SillyTavern does — which quietly made every score in this panel wrong.
+    return buildVectorQueryText();
 }
 
 /**
@@ -892,6 +901,809 @@ async function probeChatRecall() {
 }
 
 // ---------------------------------------------------------------------------
+// Lorebook recall
+//
+// A vectorised entry takes a completely different route into the prompt than a
+// keyword entry, and the two share almost no code. A keyword entry is matched
+// inside world-info.js during the scan. A vectorised entry is never matched
+// there at all: the Vector Storage extension has to nominate it first, from a
+// generation interceptor that runs before the scan, by emitting
+// WORLDINFO_FORCE_ACTIVATE. Only then does world-info.js consider it — and it
+// then puts that nomination through the same post-match gauntlet as everything
+// else.
+//
+// So "my keywords fire but my vectorised entries don't" is never one failure.
+// It is one of two, and they need completely different fixes:
+//
+//   Stage A — the vectors extension never nominated the entry.
+//     The WI toggle is off; the generation was 'quiet' or a dry run, neither of
+//     which runs interceptors; the lorebook is not attached to this chat; the
+//     entry is not actually marked vectorised; its text was never embedded, or
+//     was embedded under a different hash than the one being looked up; the
+//     query text came out empty; the similarity fell under the threshold; or
+//     other lorebooks ate the shared result budget.
+//
+//   Stage B — it was nominated, and world-info.js dropped it anyway.
+//     Disabled; a trigger or character filter; a timed effect; recursion delay;
+//     a @@dont_activate decorator; losing an inclusion group; a failed
+//     probability roll; or the token budget filling up before it was reached.
+//
+// Keyword entries are immune to every Stage A cause, which is exactly why they
+// keep working while vectorised ones silently stop. Everything below exists to
+// say which stage failed, and then which cause inside it.
+// ---------------------------------------------------------------------------
+
+/** @type {{head: string, rows: {left: string, text: string, right: string}[]} | null} */
+let lastWorldInfoReport = null;
+
+/** Sensible fallbacks matching the vectors extension's own defaults. */
+const WI_DEFAULT_MAX_ENTRIES = 5;
+const WI_DEFAULT_THRESHOLD = 0.25;
+const WI_DEFAULT_QUERY_MESSAGES = 2;
+
+/**
+ * world-info.js is already imported statically, so this is a cache hit rather
+ * than a fetch. It is dynamic only so that a build missing one of the newer
+ * named exports degrades to a single failed check instead of refusing to load
+ * the whole extension.
+ * @returns {Promise<object>}
+ */
+async function getWorldInfoModule() {
+    try {
+        return await import(/* webpackIgnore: true */ '../../../world-info.js');
+    } catch (error) {
+        console.error(`${MODULE}: could not reach world-info.js`, error);
+        return {};
+    }
+}
+
+/**
+ * The entry list SillyTavern actually scans, in scan order.
+ *
+ * This is deliberately not `loadWorldInfo()`: getSortedEntries() is what both
+ * the vectors extension and checkWorldInfo() call, and it differs from the raw
+ * book in two ways that matter here. It only includes lorebooks that are
+ * currently attached (global, character, chat or persona), and it strips
+ * decorators off `content` — which changes the hash every embedding lookup is
+ * keyed by.
+ *
+ * @returns {Promise<object[]>}
+ */
+async function getScannedEntries() {
+    const wi = await getWorldInfoModule();
+
+    if (typeof wi.getSortedEntries !== 'function') {
+        throw new Error('This SillyTavern build does not export getSortedEntries(), so the entry list it really scans cannot be read.');
+    }
+
+    const entries = await wi.getSortedEntries();
+
+    return Array.isArray(entries) ? entries : [];
+}
+
+/** @returns {Promise<string[]>} Lorebooks attached globally, if readable. */
+async function getAttachedWorldNames() {
+    const wi = await getWorldInfoModule();
+
+    return Array.isArray(wi.selected_world_info) ? [...wi.selected_world_info] : [];
+}
+
+/** Mirrors collapseNewlines() in utils.js. */
+function collapseNewlines(text) {
+    return String(text).replace(/\n+/g, '\n');
+}
+
+/**
+ * Rebuilds the query string exactly as the vectors extension's getQueryText()
+ * does: newest messages first, attachment text sliced off, macros substituted,
+ * blank messages dropped, capped at "Query messages", newlines collapsed.
+ *
+ * The macro substitution and the attachment slice are the parts that are easy
+ * to leave out and easy to be caught by — a chat whose last messages are mostly
+ * an attached file embeds almost nothing, and the query that gets embedded is
+ * then not the text you can see on screen.
+ *
+ * @returns {string}
+ */
+function buildVectorQueryText() {
+    const chat = getContext()?.chat ?? [];
+    const count = Number(extension_settings.vectors?.query) || WI_DEFAULT_QUERY_MESSAGES;
+
+    const withoutAttachments = (message) => {
+        const fileLength = message?.extra?.fileLength || 0;
+        return String(message?.mes || '').substring(fileLength).trim();
+    };
+
+    const text = chat
+        .map(x => substituteParams(withoutAttachments(x)))
+        .filter(Boolean)
+        .reverse()
+        .slice(0, count)
+        .join('\n');
+
+    return collapseNewlines(text).trim();
+}
+
+/**
+ * Groups the scanned entries the way activateWorldInfo() does, applying its
+ * skip list in the same order so the counts line up with its console output.
+ *
+ * @param {object[]} entries
+ * @returns {{byWorld: Map<string, object[]>, skipped: {orphaned: number, disabled: number, empty: number, notVectorised: number}}}
+ */
+function groupEligibleEntries(entries) {
+    const enabledForAll = !!extension_settings.vectors?.enabled_for_all;
+    const byWorld = new Map();
+    const skipped = { orphaned: 0, disabled: 0, empty: 0, notVectorised: 0 };
+
+    for (const entry of entries) {
+        if (!entry.world) {
+            skipped.orphaned++;
+            continue;
+        }
+
+        if (entry.disable) {
+            skipped.disabled++;
+            continue;
+        }
+
+        if (!entry.content) {
+            skipped.empty++;
+            continue;
+        }
+
+        if (!entry.vectorized && !enabledForAll) {
+            skipped.notVectorised++;
+            continue;
+        }
+
+        if (!byWorld.has(entry.world)) {
+            byWorld.set(entry.world, []);
+        }
+
+        byWorld.get(entry.world).push(entry);
+    }
+
+    return { byWorld, skipped };
+}
+
+/**
+ * Runs the real multi-collection query — the same endpoint, body and pooling
+ * behaviour the vectors extension uses, rather than a per-book approximation.
+ *
+ * This distinction matters more than it looks. /api/vector/query-multi pools
+ * every collection's hits into one list, sorts them by score across all books,
+ * applies the threshold, and only then takes the top K. So "Max entries" is a
+ * budget shared by every attached lorebook at once, and one chatty book can
+ * take all of it. Querying books one at a time hides that completely.
+ *
+ * @param {string[]} collectionIds
+ * @param {string} searchText
+ * @param {number} topK
+ * @param {number} threshold
+ * @returns {Promise<{results: Record<string, {hashes: number[], metadata: object[]}>, status: number, error: string}>}
+ */
+async function queryWorldCollections(collectionIds, searchText, topK, threshold) {
+    const source = getSource();
+
+    const response = await fetch('/api/vector/query-multi', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            ...buildVectorsRequestBody(source),
+            collectionIds,
+            searchText,
+            topK,
+            threshold,
+            source,
+        }),
+    });
+
+    // The vectors extension throws away the response body on failure, which is
+    // where the actual reason lives — wrong embedding dimensions after a model
+    // change, an expired key, a rate limit.
+    if (!response.ok) {
+        let detail = '';
+
+        try {
+            detail = (await response.text()).slice(0, 300);
+        } catch {
+            detail = '(no body)';
+        }
+
+        return { results: {}, status: response.status, error: detail };
+    }
+
+    const results = await response.json();
+
+    return { results: results ?? {}, status: response.status, error: '' };
+}
+
+/**
+ * Reconstructs the true cross-book ranking of the query results.
+ *
+ * The server pools every collection's hits, sorts them by score, slices the top
+ * K and only then groups them by collection — so the response tells you which
+ * book each winner came from but not the order they were in, and never the
+ * scores. Grouped output cannot be re-interleaved after the fact.
+ *
+ * The slice is the way back in. At threshold 0 a request for topK = k returns
+ * exactly the global top k, so whichever hash is new when k becomes k+1 is the
+ * one ranked k+1. Walking k upwards recovers the order one place at a time.
+ *
+ * Each step re-embeds the query server-side, so this is bounded and deliberately
+ * only ever called from a button.
+ *
+ * @param {string[]} collectionIds
+ * @param {string} searchText
+ * @param {number} depth How many places to resolve.
+ * @returns {Promise<number[]>} Hashes, best first.
+ */
+async function rankAcrossWorlds(collectionIds, searchText, depth) {
+    const order = [];
+    const seen = new Set();
+
+    for (let k = 1; k <= depth; k++) {
+        const { results, error } = await queryWorldCollections(collectionIds, searchText, k, 0);
+
+        if (error) {
+            break;
+        }
+
+        const present = Object.values(results ?? {}).flatMap(x => (x?.hashes ?? []).map(Number));
+
+        // Fewer results than places asked for means the pool is exhausted.
+        if (present.length < k) {
+            break;
+        }
+
+        const added = present.filter(hash => !seen.has(hash));
+
+        // Exactly one new hash per step is the expected shape. Anything else
+        // means the server broke a tie differently between calls, so the run is
+        // stopped rather than reported in a possibly wrong order.
+        if (added.length !== 1) {
+            break;
+        }
+
+        seen.add(added[0]);
+        order.push(added[0]);
+    }
+
+    return order;
+}
+
+/**
+ * Compares what is stored in a lorebook's collection against the hashes
+ * SillyTavern will actually look for.
+ *
+ * The lookup key is getStringHash() of the entry content as getSortedEntries()
+ * returns it — after decorators have been stripped. Anything that embeds the
+ * raw book content instead stores a different hash for those entries, and they
+ * are then unreachable forever: present in the index, never returned for a
+ * lookup, and completely invisible in the Vector Storage UI, which only ever
+ * shows a count. This separates that case from "never embedded at all".
+ *
+ * @param {string} worldName
+ * @returns {Promise<{scanned: number, eligible: number, stored: number, indexed: object[], missing: object[], wrongHash: object[], orphanHashes: number[], attached: boolean}>}
+ */
+async function auditWorldIndex(worldName) {
+    const scanned = (await getScannedEntries()).filter(x => x.world === worldName);
+    const { byWorld } = groupEligibleEntries(scanned);
+    const eligible = byWorld.get(worldName) ?? [];
+
+    const raw = await loadWorldInfo(worldName);
+    const rawByUid = new Map(Object.values(raw?.entries ?? {}).map(x => [x.uid, x]));
+
+    const stored = await getSavedHashes(getWorldCollectionId(worldName));
+    const storedSet = new Set(stored.map(Number));
+
+    const indexed = [];
+    const missing = [];
+    const wrongHash = [];
+    const claimed = new Set();
+
+    for (const entry of eligible) {
+        const lookupHash = getStringHash(entry.content);
+        const rawContent = rawByUid.get(entry.uid)?.content;
+        const rawHash = typeof rawContent === 'string' ? getStringHash(rawContent) : null;
+        const row = { uid: entry.uid, label: entryLabel(entry), lookupHash, rawHash };
+
+        if (storedSet.has(lookupHash)) {
+            claimed.add(lookupHash);
+            indexed.push(row);
+            continue;
+        }
+
+        // Stored under the pre-decorator text: the embedding exists and is
+        // perfectly good, it is simply filed under a key nothing will ask for.
+        if (rawHash !== null && rawHash !== lookupHash && storedSet.has(rawHash)) {
+            claimed.add(rawHash);
+            wrongHash.push(row);
+            continue;
+        }
+
+        missing.push(row);
+    }
+
+    const orphanHashes = [...storedSet].filter(h => !claimed.has(h));
+
+    return {
+        scanned: scanned.length,
+        eligible: eligible.length,
+        stored: stored.length,
+        indexed,
+        missing,
+        wrongHash,
+        orphanHashes,
+        attached: scanned.length > 0,
+    };
+}
+
+/**
+ * Names the gates in world-info.js that could have swallowed an entry the
+ * vectors extension successfully nominated, in the order checkWorldInfo()
+ * applies them.
+ *
+ * The scan's own decisions are not observable from outside, so this reports
+ * what the entry is *subject to* rather than pretending to know which gate
+ * closed. Anything decidable from the entry's own fields is marked certain;
+ * everything else is marked as a candidate, in check order, so the list reads
+ * top-down as "try these in this sequence".
+ *
+ * @param {object} entry Entry as it was handed to WORLDINFO_FORCE_ACTIVATE.
+ * @param {{trigger: string}} context
+ * @returns {{certain: boolean, text: string}[]}
+ */
+function explainVectorDrop(entry, context) {
+    const reasons = [];
+    const certain = text => reasons.push({ certain: true, text });
+    const maybe = text => reasons.push({ certain: false, text });
+
+    if (entry.disable === true) {
+        certain('The entry is disabled. Vector nomination happens before that check, so it is nominated and then immediately discarded.');
+    }
+
+    if (Array.isArray(entry.triggers) && entry.triggers.length > 0 && context.trigger && !entry.triggers.includes(context.trigger)) {
+        certain(`Its generation-type filter is [${entry.triggers.join(', ')}], and this generation was "${context.trigger}".`);
+    }
+
+    if (Array.isArray(entry.decorators) && entry.decorators.some(x => String(x).includes('@@dont_activate'))) {
+        certain('Its content carries a @@dont_activate decorator, which overrides an external activation.');
+    }
+
+    if (entry.characterFilter?.names?.length > 0 || entry.characterFilter?.tags?.length > 0) {
+        maybe(`It has a character filter (${entry.characterFilter.isExclude ? 'exclude' : 'include only'}), which is checked before external activations are honoured.`);
+    }
+
+    if (entry.delayUntilRecursion) {
+        maybe('It is set to delay until recursion, so it is skipped on the first scan pass regardless of how it was nominated.');
+    }
+
+    if (entry.delay || entry.cooldown) {
+        maybe(`Timed effects are set on it (${[entry.delay ? `delay ${entry.delay}` : '', entry.cooldown ? `cooldown ${entry.cooldown}` : ''].filter(Boolean).join(', ')}). Both suppress an entry before the external-activation check.`);
+    }
+
+    const group = String(entry.group ?? '').trim();
+
+    if (group) {
+        maybe(`It belongs to inclusion group "${group}". Only one entry per group survives, and a vector nomination gets no priority in that contest — a keyword entry in the same group will usually win it.`);
+    }
+
+    if (entry.useProbability && Number(entry.probability) < 100) {
+        maybe(`Its probability is ${entry.probability}%, rolled after activation.`);
+    }
+
+    maybe('The world info token budget filled before it was reached. Vector hits sort after constant and sticky entries, so they are the first to be cut.');
+
+    return reasons;
+}
+
+/**
+ * Walks the vectorised-lorebook path in the order SillyTavern walks it and
+ * stops at the first thing that is actually broken.
+ *
+ * @param {string} bookName Book to focus on, or '' for all attached books.
+ * @returns {Promise<{left: string, text: string, right: string}[]>}
+ */
+async function diagnoseWorldInfoRecall(bookName = '') {
+    const vectors = extension_settings.vectors ?? {};
+    const rows = [];
+
+    const ok = (text, right = '') => rows.push({ left: '✅', text, right });
+    const bad = (text, right = '') => rows.push({ left: '❌', text, right });
+    const warn = (text, right = '') => rows.push({ left: '⚠️', text, right });
+    const note = (text, right = '') => rows.push({ left: '·', text, right });
+
+    // --- Stage A, precondition: is the feature even switched on? ------------
+    if (!vectors.enabled_world_info) {
+        bad('"Enabled for World Info" is off in Vector Storage', 'fix this first');
+        note('This is the single switch that runs the whole vectorised path. With it off, entries marked 🔗 are not keyword-matched either — the tri-state makes vectorised and normal mutually exclusive — so they simply never fire while your keyword entries carry on working.');
+        return rows;
+    }
+
+    ok('Vectorised World Info is enabled');
+
+    const source = getSource();
+
+    if (CLIENT_SIDE_SOURCES.includes(source)) {
+        warn(`Source "${source}" embeds in the browser`, 'checks below are limited');
+        note('The probes here talk to the server directly, so they cannot reproduce a browser-side embedding. Activation still works; only this panel\'s measurements are unavailable.');
+    }
+
+    const topK = Number(vectors.max_entries) || WI_DEFAULT_MAX_ENTRIES;
+    const threshold = Number(vectors.score_threshold) || WI_DEFAULT_THRESHOLD;
+
+    // --- Stage A, entry eligibility ----------------------------------------
+    let scanned = [];
+
+    try {
+        scanned = await getScannedEntries();
+    } catch (error) {
+        bad(error.message, 'cannot continue');
+        return rows;
+    }
+
+    if (scanned.length === 0) {
+        bad('No lorebook entries are in scope for this chat at all', 'nothing attached');
+        note('No lorebook is attached globally, to this character, to this chat or to your persona. Keyword entries would not fire either — if they are firing, they are coming from a book attached somewhere this check cannot see.');
+        return rows;
+    }
+
+    const { byWorld, skipped } = groupEligibleEntries(scanned);
+    const worlds = [...byWorld.keys()];
+    const totalEligible = [...byWorld.values()].reduce((sum, list) => sum + list.length, 0);
+
+    ok(`${scanned.length} entries in scope across ${new Set(scanned.map(x => x.world)).size} attached lorebook(s)`);
+
+    if (bookName) {
+        const inScope = scanned.some(x => x.world === bookName);
+
+        if (!inScope) {
+            bad(`"${bookName}" is not attached to this chat`, 'never scanned');
+            note('Its entries are not in the list SillyTavern scans, so nothing in it can activate by any route. Attach it in the World Info panel, to the character, or to this chat.');
+            const attached = await getAttachedWorldNames();
+            if (attached.length > 0) {
+                note(`Globally attached right now: ${attached.join(', ')}`);
+            }
+            return rows;
+        }
+
+        ok(`"${bookName}" is attached and in scope`);
+    }
+
+    if (totalEligible === 0) {
+        bad('No entry in scope is marked as vectorised', 'nothing to nominate');
+        note(`Skipped: ${skipped.notVectorised} not vectorised, ${skipped.disabled} disabled, ${skipped.empty} with no content, ${skipped.orphaned} with no book. The tri-state in the entry header must be on the 🔗 setting — "constant" wins over it, so an entry that is both reads as constant.`);
+        return rows;
+    }
+
+    ok(`${totalEligible} entries eligible for vector matching`, `${worlds.length} book(s)`);
+
+    if (skipped.notVectorised > 0) {
+        note(`${skipped.notVectorised} entries in scope are not marked vectorised and are keyword-only.`);
+    }
+
+    if (bookName && !byWorld.has(bookName)) {
+        bad(`No entry in "${bookName}" is eligible`, 'not marked vectorised');
+        note('The book is attached, but every entry in it is disabled, empty, or not on the 🔗 setting. Use "Mark all as vectorized" in the Vectorising section.');
+        return rows;
+    }
+
+    // --- Stage A, index integrity ------------------------------------------
+    const auditTargets = bookName ? [bookName] : worlds;
+    let anyIndexed = false;
+    let anyWrongHash = 0;
+    let anyMissing = 0;
+
+    for (const world of auditTargets) {
+        let audit;
+
+        try {
+            audit = await auditWorldIndex(world);
+        } catch (error) {
+            warn(`Could not audit "${world}": ${error.message}`);
+            continue;
+        }
+
+        anyIndexed = anyIndexed || audit.indexed.length > 0;
+        anyWrongHash += audit.wrongHash.length;
+        anyMissing += audit.missing.length;
+
+        if (audit.missing.length === 0 && audit.wrongHash.length === 0) {
+            ok(`"${world}" fully indexed`, `${audit.indexed.length}/${audit.eligible}`);
+            continue;
+        }
+
+        if (audit.wrongHash.length > 0) {
+            bad(`${audit.wrongHash.length} entries in "${world}" are indexed under the wrong hash`, 'decorator mismatch');
+            note('These entries start with a decorator line (@@…). SillyTavern strips decorators before it hashes an entry, so the lookup asks for the hash of the stripped text while the index holds the hash of the original. The embedding exists and is never found. Purge this book and re-sync it from the Vectorising section to re-file them.');
+            for (const row of audit.wrongHash.slice(0, 5)) {
+                note(`  ${row.label}`, `uid ${row.uid}`);
+            }
+        }
+
+        if (audit.missing.length > 0) {
+            warn(`${audit.missing.length} of ${audit.eligible} entries in "${world}" have no embedding`, 're-sync');
+            for (const row of audit.missing.slice(0, 5)) {
+                note(`  ${row.label}`, `uid ${row.uid}`);
+            }
+        }
+
+        if (audit.orphanHashes.length > 0) {
+            note(`${audit.orphanHashes.length} stored embeddings in "${world}" match no current entry — edited or deleted since. Harmless, but they occupy the index.`);
+        }
+    }
+
+    if (!anyIndexed && (anyMissing > 0 || anyWrongHash > 0)) {
+        bad('Nothing usable is indexed for these books', 'run a sync');
+        note('The vectors extension only embeds lazily, at generation time, and only entries it has never seen. If it errored once mid-sync it will not retry. Use "Sync this book" or /lvt-sync-all.');
+        return rows;
+    }
+
+    // --- Stage A, the query -------------------------------------------------
+    const queryText = buildVectorQueryText();
+
+    if (!queryText) {
+        bad('The query text is empty', 'nothing to match against');
+        note(`Vector matching embeds the last ${Number(vectors.query) || WI_DEFAULT_QUERY_MESSAGES} non-empty message(s) and compares them to your entries. With no query there is no similarity, so nothing activates — while keyword entries, which scan a much deeper window, carry on matching normally. This happens on the first message of a chat and when recent messages are attachments only.`);
+        return rows;
+    }
+
+    ok(`Query is ${queryText.length} characters`, `last ${Number(vectors.query) || WI_DEFAULT_QUERY_MESSAGES} message(s)`);
+    note(`Query: "${truncate(queryText.replace(/\s+/g, ' ').trim(), 140)}"`);
+
+    // --- Stage A, the actual retrieval --------------------------------------
+    const collectionIds = worlds.map(getWorldCollectionId);
+    const idToWorld = new Map(worlds.map(w => [getWorldCollectionId(w), w]));
+
+    const live = await queryWorldCollections(collectionIds, queryText, topK, threshold);
+
+    if (live.error) {
+        bad(`The vector query failed (HTTP ${live.status})`, 'server rejected it');
+        note(live.error);
+        note('The vectors extension swallows this error, so activation just silently stops. Keyword matching does not touch the vector backend, which is why it is unaffected.');
+        return rows;
+    }
+
+    const hitsByWorld = Object.entries(live.results)
+        .map(([id, value]) => [idToWorld.get(id) ?? id, (value?.hashes ?? []).length])
+        .filter(([, count]) => count > 0);
+
+    const totalHits = hitsByWorld.reduce((sum, [, count]) => sum + count, 0);
+
+    if (totalHits === 0) {
+        bad(`Nothing scored above your threshold of ${threshold}`, 'no nominations');
+
+        // Separate "the index is unreachable" from "the index is fine, the bar
+        // is too high" — they look identical from the outside and have
+        // opposite fixes.
+        const unfiltered = await queryWorldCollections(collectionIds, queryText, 100, 0);
+        const rawTotal = Object.values(unfiltered.results ?? {}).reduce((sum, x) => sum + (x?.hashes?.length ?? 0), 0);
+
+        if (rawTotal === 0) {
+            note('At threshold 0 the collections still return nothing, so the problem is the index, not the bar: these books have no reachable embeddings for this source. If you changed embedding model or source, every stored vector is in the old model\'s space — purge and re-sync.');
+        } else {
+            note(`At threshold 0 the same query returns ${rawTotal} entries, so retrieval works and your threshold is simply above every score. Lower "Score threshold" towards 0.15 and try again. Use the probe button to see the actual scores.`);
+        }
+
+        return rows;
+    }
+
+    ok(`${totalHits} entries would be nominated`, `threshold ${threshold}`);
+
+    for (const [world, count] of hitsByWorld.sort((a, b) => b[1] - a[1])) {
+        note(`  ${world}: ${count}`, world === bookName ? 'your book' : '');
+    }
+
+    // "Max entries" is a global budget pooled across every attached book, not a
+    // per-book one. With several books attached, a single dense book can take
+    // every slot and the others go quiet — which reads exactly like the quiet
+    // book being broken.
+    if (worlds.length > 1 && totalHits >= topK) {
+        warn(`All ${topK} result slots are used, shared across ${worlds.length} books`, 'crowding');
+        note('"Max entries" is pooled across every attached lorebook, not applied per book: hits from all of them are ranked together and the top few win. A book whose entries score slightly lower gets nothing, however well indexed it is. Raise Max entries, or detach books you are not using.');
+    }
+
+    if (bookName && !hitsByWorld.some(([world]) => world === bookName)) {
+        bad(`"${bookName}" won none of the ${topK} slots`, 'outranked');
+        note('Its entries are indexed and reachable, but other attached books scored higher for this message. Run the probe to see where its best entry actually placed.');
+        return rows;
+    }
+
+    // --- Stage B, what happened to the nominations --------------------------
+    if (lastGenerationAt === null) {
+        note('Everything up to the hand-off is working. Send a message and run this again to see what world-info.js did with the nominations.');
+        return rows;
+    }
+
+    if (lastGenerationDryRun) {
+        warn('The last generation was a dry run', 'interceptors skipped');
+        note('SillyTavern skips generation interceptors on dry runs, so the vectors extension never got to nominate anything, while the world info scan still ran. Send a real message and check again.');
+        return rows;
+    }
+
+    if (lastGenerationType === 'quiet') {
+        warn('The last generation was a "quiet" one', 'vectors opt out');
+        note('The vectors extension returns immediately on quiet generations — summaries, background prompts, some group triggers. Keyword entries still fire there, vectorised ones never do. If your normal replies work and only these do not, this is the whole answer.');
+        return rows;
+    }
+
+    if (!sawForceActivate) {
+        bad('No nomination event was seen last generation', 'interceptor did not run');
+        note('Retrieval works when this panel calls it directly, but the vectors extension did not emit WORLDINFO_FORCE_ACTIVATE during the last generation, so world-info.js was never told about any of it. That points at the interceptor itself: another extension aborting the interceptor chain before Vector Storage runs, or Vector Storage being disabled in the extensions list while its settings remain on.');
+        return rows;
+    }
+
+    ok(`${pendingVectorEntries.size} entries were nominated last generation`);
+
+    if (lastDroppedVectorEntries.length === 0) {
+        ok('All of them survived the world info scan', 'stage B clean');
+        note('The vectorised path is working end to end. If entries still are not visible in the reply, they were inserted — check position and depth in the Placement section.');
+        return rows;
+    }
+
+    bad(`${lastDroppedVectorEntries.length} nominated entries were dropped by the world info scan`, 'stage B');
+    note('These were found by similarity and handed to world-info.js, which then discarded them for reasons that have nothing to do with vectors. This is where "the vectors are fine but nothing appears" comes from.');
+
+    const trigger = lastGenerationType || 'normal';
+
+    for (const entry of lastDroppedVectorEntries.slice(0, 6)) {
+        rows.push({ left: '✖', text: entryLabel(entry), right: entry.world ?? '' });
+
+        for (const reason of explainVectorDrop(entry, { trigger })) {
+            note(`  ${reason.certain ? '→ ' : '? '}${reason.text}`);
+        }
+    }
+
+    return rows;
+}
+
+/**
+ * Raw look at what the lorebook collections return, with no interpretation.
+ *
+ * diagnoseWorldInfoRecall() answers "is it broken and where". This answers
+ * "what are the numbers", which is what threshold tuning actually needs: the
+ * real ranking across books, and how far the entries you care about are from
+ * the cut.
+ *
+ * @param {string} bookName
+ * @returns {Promise<{left: string, text: string, right: string}[]>}
+ */
+async function probeWorldInfoRecall(bookName = '') {
+    const vectors = extension_settings.vectors ?? {};
+    const rows = [];
+
+    const ok = (text, right = '') => rows.push({ left: '✅', text, right });
+    const bad = (text, right = '') => rows.push({ left: '❌', text, right });
+    const warn = (text, right = '') => rows.push({ left: '⚠️', text, right });
+    const note = (text, right = '') => rows.push({ left: '·', text, right });
+
+    const topK = Number(vectors.max_entries) || WI_DEFAULT_MAX_ENTRIES;
+    const threshold = Number(vectors.score_threshold) || WI_DEFAULT_THRESHOLD;
+
+    const queryText = buildVectorQueryText();
+
+    if (!queryText) {
+        bad('Query text is empty', 'nothing to search with');
+        return rows;
+    }
+
+    const { byWorld } = groupEligibleEntries(await getScannedEntries());
+    const worlds = [...byWorld.keys()];
+
+    if (worlds.length === 0) {
+        bad('No eligible entries in any attached book', 'nothing to query');
+        return rows;
+    }
+
+    note(`Query: "${truncate(queryText.replace(/\s+/g, ' ').trim(), 120)}"`, `${queryText.length} chars`);
+    note(`Books queried: ${worlds.join(', ')}`);
+    trace(`WI PROBE: ${worlds.length} books, topK ${topK}, threshold ${threshold}`);
+
+    const collectionIds = worlds.map(getWorldCollectionId);
+
+    // Hash → entry, so returned hashes can be named rather than printed as
+    // numbers. Built from the same content the lookup is keyed by.
+    const byHash = new Map();
+
+    for (const [world, entries] of byWorld) {
+        for (const entry of entries) {
+            byHash.set(getStringHash(entry.content), { world, entry });
+        }
+    }
+
+    // A wide, unfiltered pass first: this is the true ranking, before either
+    // the threshold or the shared slot budget touches it.
+    const wide = await queryWorldCollections(collectionIds, queryText, 200, 0);
+
+    if (wide.error) {
+        bad(`Query failed (HTTP ${wide.status})`, 'server rejected it');
+        note(wide.error);
+        return rows;
+    }
+
+    const wideCount = Object.values(wide.results).reduce((sum, x) => sum + (x?.hashes?.length ?? 0), 0);
+
+    if (wideCount === 0) {
+        bad('Collections return nothing even at threshold 0', 'index unreachable');
+        note('The books have stored hashes but the query finds none of them. That is an embedding-space mismatch — the index was built with a different model or source than the one selected now. Purge and re-sync.');
+        return rows;
+    }
+
+    ok(`${wideCount} entries returned at threshold 0`, 'retrieval works');
+
+    const live = await queryWorldCollections(collectionIds, queryText, topK, threshold);
+    const winners = new Set();
+
+    for (const value of Object.values(live.results)) {
+        for (const hash of value?.hashes ?? []) {
+            winners.add(Number(hash));
+        }
+    }
+
+    if (winners.size === 0) {
+        warn(`Nothing clears threshold ${threshold}`, 'lower it');
+    } else {
+        ok(`${winners.size} of ${topK} slots filled at threshold ${threshold}`);
+    }
+
+    // The pooled ranking across books is the number that explains a quiet book,
+    // and nothing in SillyTavern shows it. It cannot simply be read off the
+    // response either: the server sorts every book's hits together, slices the
+    // top K, and only *then* groups them by collection, so the grouping throws
+    // the interleaved order away and scores are never returned at all.
+    //
+    // It is still recoverable. At threshold 0, topK = k returns exactly the
+    // global top k, so the entry that appears when k goes to k+1 is the one
+    // ranked k+1. Walking k upwards reconstructs the true order one place at a
+    // time. That costs one query per rank, which is why it is bounded and only
+    // runs from a button.
+    const ranking = await rankAcrossWorlds(collectionIds, queryText, Math.min(Math.max(topK + 3, 10), 15));
+
+    rows.push({ left: '·', text: `— true ranking across all ${worlds.length} book(s) —`, right: '' });
+
+    let sawMine = false;
+
+    ranking.forEach((hash, index) => {
+        const known = byHash.get(Number(hash));
+        const world = known?.world ?? '(unknown book)';
+        const won = winners.has(Number(hash));
+        const mine = bookName && world === bookName;
+
+        sawMine = sawMine || mine;
+
+        rows.push({
+            left: won ? '🔗' : (mine ? '🔸' : '·'),
+            text: `${index + 1}. ${known ? entryLabel(known.entry) : `hash ${hash}`}`,
+            right: `${world}${won ? ' — activated' : ''}`,
+        });
+    });
+
+    if (ranking.length === 0) {
+        note('The ranking probe returned nothing, so this build may not accept incremental topK. The counts above still hold.');
+    } else if (winners.size > 0 && winners.size < ranking.length) {
+        note(`Everything below place ${winners.size} was found and then discarded — by the threshold, by the ${topK}-slot budget, or both.`);
+    }
+
+    if (bookName) {
+        if (winners.size > 0 && [...winners].some(hash => byHash.get(hash)?.world === bookName)) {
+            ok(`"${bookName}" is winning slots`, 'activating normally');
+        } else if (sawMine) {
+            warn(`"${bookName}" ranks, but not high enough to activate`, 'outranked');
+            note(`Its entries are indexed and scoring, they are just below the cut. "Max entries" is shared across every attached book, so raising it or detaching books you are not using will let them through — that is the fix here, not re-vectorising.`);
+        } else {
+            warn(`Nothing from "${bookName}" appears in the top ${ranking.length}`, 'far behind or unindexed');
+            note('Run the index audit next. If it reports the book fully indexed, its entries are simply not similar to the current conversation, and lowering the threshold alone will not help while other books outrank them.');
+        }
+    }
+
+    note('Use "Measure similarity" on a vector hit in the entries list above for an exact score on any single entry.');
+
+    return rows;
+}
+
+// ---------------------------------------------------------------------------
 // Chat vector memories
 //
 // The vectors extension retrieves old chat messages by similarity and drops
@@ -1056,13 +1868,27 @@ function initActivationTracking() {
     // where nothing fires emits nothing. Without an explicit per-generation
     // reset, stale vector keys survive and mislabel the next turn's keyword
     // hits as 🔗, and the panel keeps showing the previous turn's results.
-    eventSource.on(event_types.GENERATION_STARTED, () => {
+    eventSource.on(event_types.GENERATION_STARTED, (type, _options, dryRun) => {
         pendingVectorKeys = new Set();
+        pendingVectorEntries = new Map();
+        lastDroppedVectorEntries = [];
+        sawForceActivate = false;
         sawActivationThisGeneration = false;
         lastQueryText = buildQueryText();
         lastChatMemories = [];
         lastDataBankChars = 0;
-        trace('GENERATION_STARTED');
+
+        // Two generation shapes never run the vectorised path at all, and both
+        // look identical to a broken setup from the outside: SillyTavern skips
+        // interceptors entirely on a dry run, and the vectors extension bails
+        // out of its own interceptor on a quiet prompt. Keyword entries fire
+        // normally in both. Recording them here is what lets the diagnostic
+        // rule that out instead of blaming the index.
+        lastGenerationType = String(type ?? 'normal');
+        lastGenerationDryRun = !!dryRun;
+        lastGenerationAt = new Date();
+
+        trace(`GENERATION_STARTED (type: ${lastGenerationType}${dryRun ? ', dry run' : ''})`);
     });
 
     // Chat memories are injected by a generation interceptor, which runs well
@@ -1081,8 +1907,15 @@ function initActivationTracking() {
         if (!Array.isArray(entries)) {
             return;
         }
+
+        // Seeing the event at all is the stage A / stage B dividing line: it
+        // means retrieval succeeded and world-info.js owns the outcome from
+        // here. Its absence means nothing was ever nominated.
+        sawForceActivate = true;
+
         for (const entry of entries) {
             pendingVectorKeys.add(entryKey(entry));
+            pendingVectorEntries.set(entryKey(entry), entry);
         }
     });
 
@@ -1093,6 +1926,15 @@ function initActivationTracking() {
         }
 
         sawActivationThisGeneration = true;
+
+        // The decisive comparison for "keywords fire, vectors don't": every
+        // entry the vectors extension nominated that is not in the set
+        // world-info.js actually inserted was found by similarity and then
+        // thrown away by the scan, for reasons unrelated to vectors.
+        const activatedKeys = new Set(entries.map(entryKey));
+        lastDroppedVectorEntries = [...pendingVectorEntries.entries()]
+            .filter(([key]) => !activatedKeys.has(key))
+            .map(([, entry]) => entry);
 
         lastActivation = entries.map(entry => ({
             world: entry.world ?? '(unknown)',
@@ -1114,11 +1956,15 @@ function initActivationTracking() {
 
     for (const endEvent of [event_types.GENERATION_ENDED, event_types.GENERATION_STOPPED]) {
         eventSource.on(endEvent, () => {
-            trace(`${endEvent} (activated: ${sawActivationThisGeneration})`);
+            trace(`${endEvent} (activated: ${sawActivationThisGeneration}, nominated: ${pendingVectorEntries.size})`);
             if (sawActivationThisGeneration) {
                 return;
             }
             // Nothing activated this turn — say so rather than leaving stale rows up.
+            // WORLD_INFO_ACTIVATED is skipped entirely when the set is empty, so
+            // this is also the only place a total wipe-out of the nominations is
+            // observable: everything vectors found was dropped by the scan.
+            lastDroppedVectorEntries = [...pendingVectorEntries.values()];
             lastActivation = [];
             lastActivationAt = new Date();
             renderActivationLog();
@@ -1138,8 +1984,9 @@ function renderActivationLog() {
 
     container.empty();
 
-    if (lastActivation.length === 0) {
+    if (lastActivation.length === 0 && lastDroppedVectorEntries.length === 0) {
         container.append('<div class="lvt-log-empty">Nothing yet — send a message.</div>');
+        renderDroppedVectorEntries();
         return;
     }
 
@@ -1151,6 +1998,8 @@ function renderActivationLog() {
             `${lastActivation.length} fired · ${counts.vector} vector · ${counts.keyword} keyword · ${counts.constant} constant · ${time}`,
         ),
     );
+
+    renderDroppedVectorEntries();
 
     for (const item of sortedActivation()) {
         const row = $('<div class="lvt-log-row"></div>');
@@ -1172,6 +2021,80 @@ function renderActivationLog() {
             if (expanded && !details.data('filled')) {
                 details.data('filled', true);
                 fillDetails(details, item);
+            }
+        });
+
+        container.append(row);
+        container.append(details);
+    }
+}
+
+/**
+ * The other half of the activation log: entries the vectors extension found and
+ * nominated, which world-info.js then refused.
+ *
+ * Nothing in SillyTavern surfaces these. They are absent from the activation
+ * log because they never activated, and absent from the vectors extension's
+ * console output because from its side the hand-off succeeded. The result is a
+ * setup that looks correct everywhere you can look, while the entries never
+ * appear — which is what makes it read as "vectors just don't work here".
+ */
+function renderDroppedVectorEntries() {
+    const container = $('#lvt_wi_dropped');
+
+    if (container.length === 0) {
+        return;
+    }
+
+    container.empty();
+
+    if (lastGenerationDryRun) {
+        container.append('<div class="lvt-log-empty">Last generation was a dry run — interceptors are skipped, so nothing was nominated.</div>');
+        return;
+    }
+
+    if (lastGenerationType === 'quiet') {
+        container.append('<div class="lvt-log-empty">Last generation was a quiet prompt — the vectors extension opts out of those entirely.</div>');
+        return;
+    }
+
+    if (lastDroppedVectorEntries.length === 0) {
+        container.append($('<div class="lvt-log-empty"></div>').text(
+            sawForceActivate
+                ? `All ${pendingVectorEntries.size} nominated entries made it into the prompt.`
+                : 'No entries were nominated by similarity last generation.',
+        ));
+        return;
+    }
+
+    container.append($('<div class="lvt-log-head"></div>').text(
+        `${lastDroppedVectorEntries.length} of ${pendingVectorEntries.size} nominated entries were dropped by the world info scan`,
+    ));
+
+    const trigger = lastGenerationType || 'normal';
+
+    for (const entry of lastDroppedVectorEntries) {
+        const row = $('<div class="lvt-log-row lvt-dropped"></div>');
+        row.append($('<span class="lvt-log-badge"></span>').text('✖'));
+        row.append($('<span class="lvt-log-name"></span>').text(entryLabel(entry)));
+        row.append($('<span class="lvt-log-world"></span>').text(entry.world ?? ''));
+
+        const details = $('<div class="lvt-log-details"></div>').hide();
+
+        row.on('click', function () {
+            const expanded = $(this).toggleClass('lvt-expanded').hasClass('lvt-expanded');
+            details.toggle(expanded);
+
+            if (expanded && !details.data('filled')) {
+                details.data('filled', true);
+
+                for (const reason of explainVectorDrop(entry, { trigger })) {
+                    details.append(
+                        $('<div class="lvt-detail"></div>')
+                            .addClass(reason.certain ? '' : 'lvt-detail-dim')
+                            .text(`${reason.certain ? '→' : '?'} ${reason.text}`),
+                    );
+                }
             }
         });
 
@@ -1499,6 +2422,43 @@ async function countRemainingKeywords(name) {
         (Array.isArray(entry.key) && entry.key.length > 0) ||
         (Array.isArray(entry.keysecondary) && entry.keysecondary.length > 0),
     ).length;
+}
+
+/**
+ * Counts what state a lorebook's entries are in, plus how many have embeddings.
+ *
+ * `embedded` is -1 rather than 0 when the collection cannot be read, because
+ * "no collection yet" and "collection exists and is empty" need different fixes
+ * and both are common.
+ *
+ * @param {string} name
+ * @returns {Promise<{total: number, vectorized: number, constant: number, disabled: number, embedded: number}>}
+ */
+async function getBookStats(name) {
+    const data = await loadWorldInfo(name);
+
+    if (!data || !data.entries) {
+        throw new Error(`Could not load lorebook "${name}"`);
+    }
+
+    const entries = Object.values(data.entries);
+    const stats = {
+        total: entries.length,
+        // The tri-state reads `constant` first, so an entry flagged both is
+        // constant in practice and must not be counted as vectorised.
+        vectorized: entries.filter(x => x.vectorized === true && x.constant !== true).length,
+        constant: entries.filter(x => x.constant === true).length,
+        disabled: entries.filter(x => x.disable === true).length,
+        embedded: -1,
+    };
+
+    try {
+        stats.embedded = (await getSavedHashes(getWorldCollectionId(name))).length;
+    } catch {
+        // No collection has been created for this book yet.
+    }
+
+    return stats;
 }
 
 /** @returns {string} Currently selected lorebook name in the extension dropdown. */
@@ -2858,6 +3818,18 @@ function addSettingsPanel() {
         <div id="lvt_activation_log" class="lvt-log"></div>
         <div class="lvt-hint">Tap an entry to see why it fired. Vector hits can be measured for similarity.</div>
 
+        <div class="lvt-subhead">Lorebook recall</div>
+        <div class="lvt-hint">Vectorised entries reach the prompt by a different route than keyword ones, so they fail differently. These follow that route end to end.</div>
+        <div id="lvt_wi_dropped" class="lvt-log"></div>
+        <div class="lvt-hint">Entries similarity found and handed over, which the world info scan then discarded. Tap one for the gates it could have failed, in the order they are checked.</div>
+        <div class="lvt-buttons">
+            <button id="lvt_wi_diagnose" class="menu_button lvt-primary">Why aren't lorebook entries firing?</button>
+            <button id="lvt_wi_probe" class="menu_button" title="Rebuilds the true cross-book ranking. Costs about 15 short embedding calls.">Probe the lorebook collections</button>
+            <button id="lvt_wi_audit" class="menu_button">Audit this book's index</button>
+            <button id="lvt_wi_copy" class="menu_button">Copy report</button>
+        </div>
+        <div id="lvt_wi_results" class="lvt-log lvt-preview"></div>
+
         <div class="lvt-subhead">Recalled chat messages</div>
         <div id="lvt_chat_memories" class="lvt-log"></div>
         <div class="lvt-hint">Old messages the vectors extension pulled back into context. 🟣 you, 🟠 the character. "N back" is how far up the chat it came from.</div>
@@ -2921,6 +3893,97 @@ function addSettingsPanel() {
     $('#lvt_refresh').on('click', () => {
         refreshBookList();
         setStatus('List refreshed.');
+    });
+
+    // The lorebook checks are scoped to the selected book when there is one:
+    // "why is nothing firing" and "why is nothing from *this* book* firing" are
+    // different questions with different answers, and the second is usually the
+    // one being asked.
+    const runWorldInfoCheck = async (head, fn) => {
+        const container = $('#lvt_wi_results');
+        container.empty().append('<div class="lvt-log-empty">Checking…</div>');
+
+        try {
+            const rows = await fn(getSelectedBook());
+            lastWorldInfoReport = { head, rows };
+            renderResultList(container, head, rows);
+        } catch (error) {
+            const rows = [{ left: '❌', text: String(error.message ?? error), right: '' }];
+            lastWorldInfoReport = { head: `${head} — failed`, rows };
+            renderResultList(container, `${head} — failed`, rows);
+        }
+    };
+
+    $('#lvt_wi_diagnose').on('click', () => runWorldInfoCheck(
+        'Lorebook recall checklist',
+        book => diagnoseWorldInfoRecall(book),
+    ));
+
+    $('#lvt_wi_probe').on('click', () => runWorldInfoCheck(
+        'Raw lorebook collection probe',
+        book => probeWorldInfoRecall(book),
+    ));
+
+    $('#lvt_wi_audit').on('click', () => runWorldInfoCheck(
+        'Index audit',
+        async (book) => {
+            if (!book) {
+                return [{ left: '❌', text: 'Pick a lorebook first.', right: '' }];
+            }
+
+            const audit = await auditWorldIndex(book);
+            const rows = [];
+
+            if (!audit.attached) {
+                rows.push({ left: '❌', text: `"${book}" is not attached to this chat, so it is never scanned.`, right: 'not in scope' });
+                return rows;
+            }
+
+            rows.push({ left: '·', text: `${audit.eligible} entries eligible, ${audit.stored} embeddings stored`, right: book });
+            rows.push({ left: audit.indexed.length === audit.eligible ? '✅' : '⚠️', text: `${audit.indexed.length} correctly indexed and reachable`, right: '' });
+
+            if (audit.wrongHash.length > 0) {
+                rows.push({ left: '❌', text: `${audit.wrongHash.length} indexed under a hash nothing looks up`, right: 'decorators' });
+                rows.push({ left: '·', text: 'Their content begins with a @@ decorator line. SillyTavern strips decorators before hashing, so the lookup and the index disagree and these can never be returned. Purge this book and re-sync it.', right: '' });
+            }
+
+            for (const row of audit.wrongHash) {
+                rows.push({ left: '✖', text: row.label, right: `uid ${row.uid}` });
+            }
+
+            if (audit.missing.length > 0) {
+                rows.push({ left: '⚠️', text: `${audit.missing.length} have no embedding at all`, right: 'sync needed' });
+            }
+
+            for (const row of audit.missing.slice(0, 20)) {
+                rows.push({ left: '·', text: row.label, right: `uid ${row.uid}` });
+            }
+
+            if (audit.orphanHashes.length > 0) {
+                rows.push({ left: '·', text: `${audit.orphanHashes.length} stored embeddings match no current entry — leftovers from edits.`, right: '' });
+            }
+
+            return rows;
+        },
+    ));
+
+    $('#lvt_wi_copy').on('click', async () => {
+        if (!lastWorldInfoReport) {
+            setStatus('Run a check first.', 'error');
+            return;
+        }
+
+        const text = [
+            lastWorldInfoReport.head,
+            ...lastWorldInfoReport.rows.map(r => `${r.left} ${r.text}${r.right ? `  [${r.right}]` : ''}`),
+        ].join('\n');
+
+        try {
+            await navigator.clipboard.writeText(text);
+            setStatus('Report copied.', 'success');
+        } catch {
+            setStatus('Copy failed — select the text manually.', 'error');
+        }
     });
 
     $('#lvt_diagnose').on('click', async () => {
@@ -3511,6 +4574,24 @@ function registerCommands() {
     }));
 
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lvt-why',
+        helpString: 'Explains why vectorised lorebook entries are not activating. Pass a lorebook name to scope it to that book.',
+        returns: 'the checklist as text',
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({
+                description: 'lorebook name (optional)',
+                typeList: [ARGUMENT_TYPE.STRING],
+                isRequired: false,
+                enumProvider: () => world_names.map(x => new SlashCommandEnumValue(x)),
+            }),
+        ],
+        callback: async (_args, value) => {
+            const rows = await diagnoseWorldInfoRecall(String(value ?? '').trim());
+            return rows.map(r => `${r.left} ${r.text}${r.right ? ` [${r.right}]` : ''}`).join('\n');
+        },
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lvt-purge',
         helpString: 'Deletes stored embeddings for the named lorebook.',
         unnamedArgumentList: [bookArgument()],
@@ -3527,6 +4608,7 @@ jQuery(async () => {
     initActivationTracking();
     initAutoSync();
     renderActivationLog();
+    renderDroppedVectorEntries();
     renderChatMemories();
     renderTrace();
     console.log(`${MODULE}: loaded`);
